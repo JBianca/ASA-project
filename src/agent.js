@@ -1,6 +1,8 @@
 import { DeliverooApi } from "@unitn-asa/deliveroo-js-client";
 import config from "../config.js";
 import AStarDaemon from "./astar_daemon.js";
+import { distance } from './utils.js';
+import selectOptimalBatch from "./select_batch.js";
 
 const client = new DeliverooApi(
   config.host,
@@ -14,12 +16,6 @@ client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
   DECAY_INTERVAL_MS = parseInt(cfg.PARCEL_DECADING_INTERVAL) * 1000;
 });
-
-function distance({x:x1, y:y1}, {x:x2, y:y2}) {
-    const dx = Math.abs(Math.round(x1) - Math.round(x2));
-    const dy = Math.abs(Math.round(y1) - Math.round(y2));
-    return dx + dy;
-}
 
 const me = {id: null, name: null, x: null, y: null, score: null};
 
@@ -141,79 +137,59 @@ client.onAgentsSensing(sensedAgents => {
 const aStarDaemon = new AStarDaemon(mapTiles);
 
 function optionsGeneration() {
+  // if the *current* intention is BulkCollect, do nothing (don't replan!)
+  const current = myAgent.intention_queue[0];
+  if (current?.predicate[0] === 'bulk_collect') {
+    return;
+  }
+
   const options   = [];
   const carried   = [...parcels.values()].find(p => p.carriedBy === me.id);
   const available = [...parcels.values()].filter(p => !p.carriedBy);
-  const opponents = [...agents.values()].filter(a => a.id !== me.id);
 
-  // configuration
-  const safetyMargin    = 2;    // opponents within this many steps → contested
-  const contestPenalty  = 10;   // extra penalty for contested parcels
-  const decayIntervalS  = DECAY_INTERVAL_MS / 1000;
-
-  // 1) Build candidate list with utilities + contest info
-  const candidates = available.map(p => {
-    // your A* path length to pickup
-    const d1 = aStarDaemon.aStar({ x: me.x, y: me.y }, p, n => distance(n, p))?.length ?? Infinity;
-
-    // distance from the parcel to its nearest delivery zone
-    const dz = deliveryZones.reduce((a, b) =>
-      distance(p, a) < distance(p, b) ? a : b
-    );
-    const d2 = aStarDaemon.aStar(p, dz, n => distance(n, dz))?.length ?? Infinity;
-
-    // opponent distance to this parcel
-    const oppDist = opponents.length
-      ? Math.min(...opponents.map(a => distance(a, p)))
-      : Infinity;
-
-    // base utility
-    let utility = p.reward
-      - PENALTY * ((d1 + d2) / decayIntervalS);
-
-    // if contested, knock down the utility
-    if (oppDist <= d1 + safetyMargin) {
-      utility -= contestPenalty;
-    }
-
-    return { p, d1, d2, oppDist, utility };
-  })
-  // filter out fully unreachable (blocked) parcels
-  .filter(c => isFinite(c.d1) && isFinite(c.d2));
-
-  // 2) Sort by descending utility
-  candidates.sort((a, b) => {
-    if (b.utility !== a.utility) return b.utility - a.utility;
-    if (a.d1      !== b.d1     ) return a.d1     - b.d1;
-    return a.p.id.localeCompare(b.p.id);
-  });
-
-  // 3) Decide intention
+  // 1) If you're carrying something, go deliver.
   if (carried && deliveryZones.length) {
     const dz = deliveryZones.reduce((a, b) =>
       distance(me, a) < distance(me, b) ? a : b
     );
     options.push(['go_deliver', dz.x, dz.y]);
   }
-  else if (candidates.length) {
-    const best = candidates[0];
-    options.push(['go_pick_up', best.p.x, best.p.y, best.p.id]);
+  else if (available.length > 0) {
+    // 2) Compute the optimal batch (size up to 3)
+    // TODO: think about how to set this dynimically?
+    const { netUtil, route } = selectOptimalBatch(
+      available,
+      { x: me.x, y: me.y },
+      deliveryZones,
+      aStarDaemon,
+      PENALTY,
+      DECAY_INTERVAL_MS/1000,
+      /*maxK=*/3
+    );
+
+    if (route.length > 1) {
+      // multi‐pickup run
+      // pass the parcel IDs as arguments
+      options.push(['bulk_collect', ...route.map(p => p.id)]);
+    }
+    else {
+      // single‐pickup run
+      const p = route[0];
+      options.push(['go_pick_up', p.x, p.y, p.id]);
+    }
   }
   else {
+    // 3) Nothing to do: patrol
     options.push(['patrolling']);
   }
 
-  // 4) Deduplicate against current intention
-  const best_option = options[0];
-  if (best_option) {
-    const lastInt  = myAgent.intention_queue.at(-1);
-    const lastPred = lastInt?.predicate;
-    const same = Array.isArray(lastPred)
-      && lastPred.length === best_option.length
-      && lastPred.every((v,i) => String(v) === String(best_option[i]));
-    if (!same) myAgent.push(best_option);
-  }
-}  
+  // 4) don’t re‐push the same intention twice
+  const best = options[0];
+  const last = myAgent.intention_queue.at(-1);
+  const same = last?.predicate?.length === best.length
+    && last.predicate.every((v,i)=>String(v)===String(best[i]));
+  if (!same) myAgent.push(best);
+} 
 
 client.onParcelsSensing(optionsGeneration);
 client.onAgentsSensing(optionsGeneration);
@@ -409,6 +385,12 @@ class AstarMove extends Plan {
     }
     async execute(goal, x, y) {
       this.log('AstarMove from', me.x, me.y, 'to', { x, y });
+
+      // SHORT‑CIRCUIT IF YOU'RE ALREADY ON TARGET
+      if (me.x === x && me.y === y) {
+        this.log('AstarMove: start===goal, nothing to do');
+        return true;
+      }
   
       const start = { x: me.x, y: me.y };
       const goalNode = { x, y };
@@ -431,6 +413,66 @@ class AstarMove extends Plan {
       }
       return true;
     }
+}
+
+class BulkCollect extends Plan {
+  static isApplicableTo(goal) {
+    return goal === 'bulk_collect';
+  }
+
+  /**
+   * predicate = ['bulk_collect', id1, id2, ..., idN]
+   */
+  async execute(goal, ...ids) {
+    if (this.stopped) throw ['stopped'];
+    this.log('BulkCollect starting…');
+
+    // 1) map IDs to parcel objects (may have moved or been stolen so filter those out)
+    const batch = ids
+      .map(id => parcels.get(id))
+      .filter(p => p && !p.carriedBy);
+
+    if (batch.length === 0) {
+      this.log('BulkCollect: nothing to batch, falling back to patrol');
+      await this.subIntention(['patrolling']);
+      return true;
+    }
+
+    // 2) Walk and pickup each in turn
+    for (const p of batch) {
+      if (this.stopped) throw ['stopped'];
+      this.log(`BulkCollect → heading to pickup ${p.id} @ (${p.x},${p.y})`);
+      if (me.x !== p.x || me.y !== p.y) {
+        await this.subIntention(['go_to', p.x, p.y]);
+      }
+      if (this.stopped) throw ['stopped'];
+      this.log(`BulkCollect → picking up ${p.id}`);
+      const ok = await client.emitPickup();
+      if (!ok) {
+        this.log('BulkCollect: pickup failed for', p.id, ', aborting rest');
+        break;
+      }
+      parcels.delete(p.id);
+    }
+
+    // 3) Deliver if we got at least one
+    const carriedCount = batch.length;
+    if (carriedCount && deliveryZones.length) {
+      const dz = deliveryZones.reduce((a, b) =>
+        distance(me, a) < distance(me, b) ? a : b
+      );
+      this.log('BulkCollect → delivering to', dz);
+      await this.subIntention(['go_to', dz.x, dz.y]);
+      for (let i = 0; i < carriedCount; i++) {
+        if (this.stopped) throw ['stopped'];
+        this.log('BulkCollect → putdown parcel');
+        await client.emitPutdown();
+      }
+    }
+
+    this.log('BulkCollect → DONE');
+    return true;
+  }
 }
 
 class BlindMove extends Plan {
@@ -500,4 +542,5 @@ planLibrary.push(GoPickUp);
 planLibrary.push(Patrolling)
 planLibrary.push(GoDeliver);
 planLibrary.push(AstarMove);
+planLibrary.push(BulkCollect)
 //planLibrary.push(BlindMove);
