@@ -117,10 +117,14 @@ class AStarDaemon {
       ];
 
       for (const nb of neighbors) {
-        const k = key(nb);
-        const t = this.map.get(k);
-        if (t === undefined || t === 0) continue;  // OOB or wall
-
+        const k    = key(nb);
+        const tile = this.map.get(k);
+      
+        // skip OOB, walls, or occupied tiles
+        if (!tile || tile.type === 0 || tile.locked) {
+          continue;
+        }
+      
         const tentative_g = (gScore.get(key(current)) ?? Infinity) + 1;
         if (tentative_g < (gScore.get(k) ?? Infinity)) {
           cameFrom.set(k, current);

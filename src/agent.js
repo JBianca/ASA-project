@@ -112,14 +112,23 @@ const mapTiles = new Map();
 client.onMap((width, height, tiles) => {
   mapTiles.clear();
   for (const t of tiles) {
-    mapTiles.set(`${t.x},${t.y}`, t.type);
+    // store an object, with both type and locked flag
+    mapTiles.set(
+      `${t.x},${t.y}`,
+      { type: t.type, locked: false }
+    );
   }
 });
+
+// When a single tile updates:
 client.onTile(tile => {
-  mapTiles.set(`${tile.x},${tile.y}`, tile.type);
+  const key = `${tile.x},${tile.y}`;
+  const entry = mapTiles.get(key);
+  if (entry) {
+    entry.type = tile.type;
+  }
 });
 
-// TODO: improve onAgentsSensing
 const agents = new Map();
 client.onAgentsSensing(sensedAgents => {
   for (const a of sensedAgents) {
@@ -131,6 +140,18 @@ client.onAgentsSensing(sensedAgents => {
     if (!seenIds.has(id)) {
       agents.delete(id);
     }
+  }
+
+  // 2a) clear ALL old locks:
+  for (const entry of mapTiles.values()) {
+    entry.locked = false;
+  }
+
+  // 2b) lock the tiles under each sensed agent:
+  for (const a of sensedAgents) {
+    const key = `${a.x},${a.y}`;
+    const tile = mapTiles.get(key);
+    if (tile) tile.locked = true;
   }
 });
 
@@ -384,33 +405,47 @@ class AstarMove extends Plan {
       return goal === 'go_to';
     }
     async execute(goal, x, y) {
-      this.log('AstarMove from', me.x, me.y, 'to', { x, y });
+      const plan = aStarDaemon.aStar(
+        { x: me.x, y: me.y },
+        { x, y },
+        n => Math.abs(n.x - x) + Math.abs(n.y - y)
+      );
+      // console.log('A* plan =', plan);
 
-      // SHORT‑CIRCUIT IF YOU'RE ALREADY ON TARGET
-      if (me.x === x && me.y === y) {
-        this.log('AstarMove: start===goal, nothing to do');
-        return true;
-      }
-  
-      const start = { x: me.x, y: me.y };
-      const goalNode = { x, y };
-      const h = n => Math.abs(n.x - x) + Math.abs(n.y - y);  // Manhattan distance
-  
-      const plan = aStarDaemon.aStar(start, goalNode, h);
-      if (plan === "failure" || plan.length === 0) {
-        throw 'target not reachable';
+      if (plan === 'failure' || !Array.isArray(plan) || plan.length === 0) {
+        this.log('AstarMove: no path found → aborting to replan/fallback');
+        throw ['stopped']; 
       }
   
       for (const step of plan) {
         if (this.stopped) throw ['stopped'];
-        const status = await client.emitMove(step.action);
-        if (!status) {
-          this.log('AstarMove replanning from', me.x, me.y);
-          break;
+  
+        // DEBUG
+        const key = `${step.x},${step.y}`;
+        console.log(
+          '→ next step', step,
+          'mapTiles.has=', mapTiles.has(key),
+          'tile=', mapTiles.get(key)
+        );
+  
+        // locked‐tile check
+        const tile = mapTiles.get(key);
+        if (tile?.locked) {
+          console.log('  aborting because locked → replanning');
+          throw ['stopped'];
         }
+  
+        const status = await client.emitMove(step.action);
+        console.log('  emitMove returned', status);
+        if (!status) {
+          console.log('  blocked by wall or collision → replanning');
+          throw ['stopped'];
+        }
+  
         me.x = status.x;
         me.y = status.y;
       }
+  
       return true;
     }
 }
@@ -455,14 +490,40 @@ class BulkCollect extends Plan {
       parcels.delete(p.id);
     }
 
-    // 3) Deliver if we got at least one
+    // 3) Deliver whatever you’ve actually picked up so far
     const carriedCount = batch.length;
     if (carriedCount && deliveryZones.length) {
-      const dz = deliveryZones.reduce((a, b) =>
-        distance(me, a) < distance(me, b) ? a : b
+      // helper for nearest DZ
+      const nearestDZ = () => deliveryZones.reduce((a,b)=>
+        distance({x:me.x,y:me.y},a) < distance({x:me.x,y:me.y},b) ? a : b
       );
-      this.log('BulkCollect → delivering to', dz);
-      await this.subIntention(['go_to', dz.x, dz.y]);
+      let dz = nearestDZ();
+
+      // KEEP TRYING to path to DZ until you make it
+      let attempts = 0;
+      while (true) {
+        try {
+          await this.subIntention(['go_to', dz.x, dz.y]);
+          break;
+        }
+        catch (err) {
+          attempts++;
+          this.log(`delivery blocked (attempt ${attempts})`);
+      
+          if (attempts > 5) {
+            // enough retries → back off OR TODO: go to 2nd closest delivery tile instead?
+            this.log('  too many retries, stepping aside to break deadlock');
+            await this.subIntention(['go_to', me.x + (Math.random()>0.5?1:-1), me.y]);
+            await new Promise(r=>setTimeout(r, 200));
+            attempts = 0;    // reset and try main route again
+          }
+          else {
+            // simple wait before retry
+            await new Promise(r=>setTimeout(r, 300));
+          }
+        }
+      }
+
       for (let i = 0; i < carriedCount; i++) {
         if (this.stopped) throw ['stopped'];
         this.log('BulkCollect → putdown parcel');
