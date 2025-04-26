@@ -360,44 +360,19 @@ class GoPickUp extends Plan {
   async execute(goal, x, y, id) {
     if (this.stopped) throw ['stopped'];
 
-    // 0) if we're already on top of it, just pick it up
+    // If we're already standing on the parcel, pick it up right away.
     if (me.x === x && me.y === y) {
-      this.log(`GoPickUp: already on parcel ${id}, picking up`);
+      this.log('GoPickUp: already on parcel, picking up');
       await client.emitPickup();
       if (this.stopped) throw ['stopped'];
       return true;
     }
 
-    // 1) try moving to it up to MAX_PICKUP_TRIES times
-    let reached = false;
-    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-      if (this.stopped) throw ['stopped'];
-      this.log(`GoPickUp → moving to parcel ${id} @(${x},${y}) [attempt ${attempt}]`);
-      try {
-        await this.subIntention(['go_to', x, y]);
-        reached = true;
-        break;
-      } catch (err) {
-        this.log(`  GoPickUp: path blocked on attempt ${attempt}`);
-        // tiny back-off before retrying
-        await new Promise(r => setTimeout(r, 200));
-      }
-    }
+    await this.subIntention(['go_to', x, y]);
+    if (this.stopped) throw ['stopped'];
 
-    // 2) if still unreachable, give up
-    if (!reached) {
-      this.log(`GoPickUp: parcel ${id} unreachable after ${MAX_TRIES} tries — aborting`);
-      parcels.delete(id); 
-      throw ['stopped'];
-    }
-
-    // 3) finally, pick it up
-    this.log(`GoPickUp → picking up parcel ${id}`);
-    const ok = await client.emitPickup();
-    if (!ok) {
-      this.log(`GoPickUp: pickup failed for ${id}`);
-      throw ['stopped'];
-    }
+    await client.emitPickup();
+    if (this.stopped) throw ['stopped'];
 
     return true;
   }
