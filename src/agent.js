@@ -12,6 +12,9 @@ const client = new DeliverooApi(
 let PENALTY;
 let DECAY_INTERVAL_MS;
 
+const MAX_TRIES = 3;
+const suspendedDeliveries = new Set();
+
 client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
   DECAY_INTERVAL_MS = parseInt(cfg.PARCEL_DECADING_INTERVAL) * 1000;
@@ -41,6 +44,7 @@ client.onParcelsSensing(pp => {
       parcels.delete(p.id);
       continue;
     }
+
     // Otherwise upsert with stamps
     const spawnTime     = old ? old.spawnTime     : now;
     const initialReward = old ? old.initialReward : p.reward;
@@ -64,6 +68,8 @@ client.onParcelsSensing(pp => {
 
     // B) _you_ delivered it?  i.e. you were carrying it, now you no longer see it
     if (p.carriedBy === me.id && !seenIds.has(id)) {
+      // you just dropped it → clear both from parcels _and_ any suspension
+      suspendedDeliveries.delete(id);
       parcels.delete(id);
       continue;
     }
@@ -79,6 +85,17 @@ client.onParcelsSensing(pp => {
     if (now - p.spawnTime > maxLifetime) {
       parcels.delete(id);
       continue;
+    }
+  }
+
+  // 3) Finally, if any suspended deliveries are no longer carriedBy you at all,
+  //    un-suspend them (they must’ve been dropped elsewhere).
+  const stillCarried = new Set(
+    pp.filter(p => p.carriedBy === me.id).map(p => p.id)
+  );
+  for (const id of suspendedDeliveries) {
+    if (!stillCarried.has(id)) {
+      suspendedDeliveries.delete(id);
     }
   }
 });
@@ -165,7 +182,8 @@ function optionsGeneration() {
   }
 
   const options   = [];
-  const carried   = [...parcels.values()].find(p => p.carriedBy === me.id);
+  const carried = [...parcels.values()]
+    .find(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id));
   const available = [...parcels.values()].filter(p => !p.carriedBy);
 
   // 1) If you're carrying something, go deliver.
@@ -342,37 +360,88 @@ class GoPickUp extends Plan {
   async execute(goal, x, y, id) {
     if (this.stopped) throw ['stopped'];
 
-    // If we're already standing on the parcel, pick it up right away.
+    // 0) if we're already on top of it, just pick it up
     if (me.x === x && me.y === y) {
-      this.log('GoPickUp: already on parcel, picking up');
+      this.log(`GoPickUp: already on parcel ${id}, picking up`);
       await client.emitPickup();
       if (this.stopped) throw ['stopped'];
       return true;
     }
 
-    await this.subIntention(['go_to', x, y]);
-    if (this.stopped) throw ['stopped'];
+    // 1) try moving to it up to MAX_PICKUP_TRIES times
+    let reached = false;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+      if (this.stopped) throw ['stopped'];
+      this.log(`GoPickUp → moving to parcel ${id} @(${x},${y}) [attempt ${attempt}]`);
+      try {
+        await this.subIntention(['go_to', x, y]);
+        reached = true;
+        break;
+      } catch (err) {
+        this.log(`  GoPickUp: path blocked on attempt ${attempt}`);
+        // tiny back-off before retrying
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
 
-    await client.emitPickup();
-    if (this.stopped) throw ['stopped'];
+    // 2) if still unreachable, give up
+    if (!reached) {
+      this.log(`GoPickUp: parcel ${id} unreachable after ${MAX_TRIES} tries — aborting`);
+      parcels.delete(id); 
+      throw ['stopped'];
+    }
+
+    // 3) finally, pick it up
+    this.log(`GoPickUp → picking up parcel ${id}`);
+    const ok = await client.emitPickup();
+    if (!ok) {
+      this.log(`GoPickUp: pickup failed for ${id}`);
+      throw ['stopped'];
+    }
 
     return true;
   }
 }
 
 class GoDeliver extends Plan {
-    static isApplicableTo(goal, x, y) {
-        return goal === 'go_deliver';
+  static isApplicableTo(goal, x, y) {
+    return goal === 'go_deliver';
+  }
+
+  async execute(goal, x, y) {
+    // collect the *active* carried IDs
+    const toDeliver = [...parcels.values()]
+      .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
+      .map(p => p.id);
+
+    if (!toDeliver.length) {
+      this.log('GoDeliver: nothing to deliver (all suspended)');
+      return true;
     }
 
-    async execute(goal, x, y) {
-        if (this.stopped) throw ['stopped'];
-        await this.subIntention(['go_to', x, y]);
-        if (this.stopped) throw ['stopped'];
-        await client.emitPutdown();
-        if (this.stopped) throw ['stopped'];
-        return true;
+    // same “try each delivery‐zone with back-off” you already have…
+    const zones = deliveryZones.slice().sort((a,b)=>distance(me,a)-distance(me,b));
+    for (const dz of zones) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          this.log(`GoDeliver → to ${dz.x},${dz.y} [attempt ${attempt}]`);
+          await this.subIntention(['go_to', dz.x, dz.y]);
+          // success!
+          for (const id of toDeliver) suspendedDeliveries.delete(id);
+          await client.emitPutdown();  // drop one by one if you like
+          return true;
+        } catch (_) {
+          this.log(`  GoDeliver: blocked at (${dz.x},${dz.y}) on attempt ${attempt}`);
+        }
+      }
+      this.log(`  GoDeliver: giving up on zone (${dz.x},${dz.y}), trying next`);
     }
+
+    // if we get here, *all* zones failed → suspend these parcels
+    for (const id of toDeliver) suspendedDeliveries.add(id);
+    this.log('GoDeliver: all zones blocked → suspending delivery of', toDeliver);
+    throw ['stopped'];   // abort so that optionsGeneration will pick something else
+  }
 }
 
 class Patrolling extends Plan {
@@ -490,40 +559,14 @@ class BulkCollect extends Plan {
       parcels.delete(p.id);
     }
 
-    // 3) Deliver whatever you’ve actually picked up so far
+    // 3) Deliver if we got at least one
     const carriedCount = batch.length;
     if (carriedCount && deliveryZones.length) {
-      // helper for nearest DZ
-      const nearestDZ = () => deliveryZones.reduce((a,b)=>
-        distance({x:me.x,y:me.y},a) < distance({x:me.x,y:me.y},b) ? a : b
+      const dz = deliveryZones.reduce((a, b) =>
+        distance(me, a) < distance(me, b) ? a : b
       );
-      let dz = nearestDZ();
-
-      // KEEP TRYING to path to DZ until you make it
-      let attempts = 0;
-      while (true) {
-        try {
-          await this.subIntention(['go_to', dz.x, dz.y]);
-          break;
-        }
-        catch (err) {
-          attempts++;
-          this.log(`delivery blocked (attempt ${attempts})`);
-      
-          if (attempts > 5) {
-            // enough retries → back off OR TODO: go to 2nd closest delivery tile instead?
-            this.log('  too many retries, stepping aside to break deadlock');
-            await this.subIntention(['go_to', me.x + (Math.random()>0.5?1:-1), me.y]);
-            await new Promise(r=>setTimeout(r, 200));
-            attempts = 0;    // reset and try main route again
-          }
-          else {
-            // simple wait before retry
-            await new Promise(r=>setTimeout(r, 300));
-          }
-        }
-      }
-
+      this.log('BulkCollect → delivering to', dz);
+      await this.subIntention(['go_to', dz.x, dz.y]);
       for (let i = 0; i < carriedCount; i++) {
         if (this.stopped) throw ['stopped'];
         this.log('BulkCollect → putdown parcel');
