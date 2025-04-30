@@ -19,7 +19,7 @@ function readFile ( path ) {
 async function main () {
 
     let problem = await readFile('./problem.pddl' );
-    console.log( problem );
+    //console.log( problem );
     let domain = await readFile('./domain.pddl' );
 
     var plan = await onlineSolver(domain, problem);
