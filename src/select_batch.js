@@ -37,7 +37,7 @@ function selectOptimalBatch(
   for (const p of parcels) {
     const d1 = dist[`0-${p.id}`];         // start→p
     const d2 = deliveryDist[p.id];        // p→deliver
-    const net = p.reward - PENALTY*((d1+d2)/decayIntervalS);
+    const net = p.expectedUtility - PENALTY*((d1+d2)/decayIntervalS);
     if (net > bestRun.netUtil) {
       bestRun = { netUtil: net, route: [p], order: [p] };
     }
@@ -68,7 +68,7 @@ function selectOptimalBatch(
         ));
         travelCost += d2 * carried;
 
-        const rewardSum = perm.reduce((s,p)=>s+p.reward, 0);
+        const rewardSum = perm.reduce((s,p)=>s+p.expectedUtility, 0);
         const net = rewardSum - PENALTY*(travelCost/decayIntervalS);
         if (net > bestRun.netUtil) {
           bestRun = { netUtil: net, route: perm };

@@ -1,7 +1,7 @@
 import { DeliverooApi } from "@unitn-asa/deliveroo-js-client";
 import config from "../config.js";
 import AStarDaemon from "./astar_daemon.js";
-import { distance } from './utils.js';
+import { distance, pickOldestSector, markSector, SECTOR_SIZE } from './utils.js';
 import selectOptimalBatch from "./select_batch.js";
 
 const client = new DeliverooApi(
@@ -12,7 +12,11 @@ const client = new DeliverooApi(
 let PENALTY;
 let DECAY_INTERVAL_MS;
 
-const MAX_TRIES = 3;
+const CONTEST_RADIUS = 3;    // Manhattan distance threshold
+const CONTEST_PENALTY = 0.5;  // 50% discount on contested parcels
+const MAX_SECTORS_TO_TRY = 5;
+const MAX_TILES_PER_SECTOR = 10;
+
 const suspendedDeliveries = new Set();
 
 client.onConfig(cfg => {
@@ -45,6 +49,17 @@ client.onParcelsSensing(pp => {
       continue;
     }
 
+    // anybody else strictly closer (or tie) to this parcel?
+    const rivals = [...agents.values()]
+      .filter(a => a.id !== me.id);
+    const contested = rivals.some(a =>
+      distance(a, p) <= distance(me, p)
+    );
+
+    const expectedUtility = contested
+      ? p.reward * (1 - CONTEST_PENALTY)
+      : p.reward;
+
     // Otherwise upsert with stamps
     const spawnTime     = old ? old.spawnTime     : now;
     const initialReward = old ? old.initialReward : p.reward;
@@ -53,7 +68,8 @@ client.onParcelsSensing(pp => {
       ...p,
       lastSeen:      now,
       spawnTime,
-      initialReward
+      initialReward,
+      expectedUtility
     });
   }
 
@@ -124,7 +140,7 @@ client.onTile(tile => {
   }
 });
 
-const mapTiles = new Map();
+export const mapTiles = new Map();
 
 client.onMap((width, height, tiles) => {
   mapTiles.clear();
@@ -169,6 +185,21 @@ client.onAgentsSensing(sensedAgents => {
     const key = `${a.x},${a.y}`;
     const tile = mapTiles.get(key);
     if (tile) tile.locked = true;
+  }
+
+  // 3) mark every parcel.p.contested = true if some other agent is near it
+  for (const p of parcels.values()) {
+    let contested = false;
+    for (const a of sensedAgents) {
+      if (a.id !== me.id) {
+        const d = Math.abs(a.x - p.x) + Math.abs(a.y - p.y);
+        if (d <= CONTEST_RADIUS) {
+          contested = true;
+          break;
+        }
+      }
+    }
+    p.contested = contested;
   }
 });
 
@@ -368,8 +399,17 @@ class GoPickUp extends Plan {
       return true;
     }
 
-    await this.subIntention(['go_to', x, y]);
-    if (this.stopped) throw ['stopped'];
+    try {
+      await this.subIntention(['go_to', x, y]);
+    } catch (err) {
+      this.log(`GoPickUp: parcel ${id} unreachable — discounting & skipping`);
+      const p = parcels.get(id);
+      if (p) {
+        p.expectedUtility = p.expectedUtility * CONTEST_PENALTY;
+        parcels.set(id, p);
+      }
+      throw ['stopped'];
+    }
 
     await client.emitPickup();
     if (this.stopped) throw ['stopped'];
@@ -420,39 +460,74 @@ class GoDeliver extends Plan {
 }
 
 class Patrolling extends Plan {
-    static isApplicableTo(goal) {
-      return goal === 'patrolling';
+  static isApplicableTo(goal) {
+    return goal === 'patrolling';
+  }
+
+  async execute(goal) {
+    if (this.stopped) throw ['stopped'];
+
+    // Try a handful of different sectors
+    for (let sTry = 1; sTry <= MAX_SECTORS_TO_TRY; sTry++) {
+      const [sx, sy] = pickOldestSector();
+      markSector(me.x, me.y);    // mark *current* sector so we age others
+      markSector(sx * SECTOR_SIZE, sy * SECTOR_SIZE); // also mark chosen sector
+
+      // collect all tiles in that sector
+      const x0 = sx * SECTOR_SIZE, y0 = sy * SECTOR_SIZE;
+      const candidates = [];
+      for (const key of mapTiles.keys()) {
+        const [x, y] = key.split(',').map(Number);
+        if (x >= x0 && x < x0 + SECTOR_SIZE
+         && y >= y0 && y < y0 + SECTOR_SIZE) {
+          candidates.push({ x, y });
+        }
+      }
+      if (candidates.length === 0) continue;  // weird empty sector
+
+      // try up to MAX_TILES_PER_SECTOR random picks
+      for (let tTry = 1; tTry <= MAX_TILES_PER_SECTOR; tTry++) {
+        if (this.stopped) throw ['stopped'];
+
+        const { x, y } = candidates[Math.floor(Math.random() * candidates.length)];
+        this.log(`Patrolling → sector ${sx},${sy} → attempt ${tTry} @ (${x},${y})`);
+        try {
+          await this.subIntention(['go_to', x, y]);
+          return true;  // success—keep patrolling until you’re stopped externally
+        } catch {
+          this.log(`  Patrolling: (${x},${y}) blocked, retrying…`);
+          // immediate retry; no setTimeout
+        }
+      }
+
+      this.log(`Patrolling: sector ${sx},${sy} exhausted, picking new sector…`);
     }
-  
-    async execute(goal) {
-      if (this.stopped) throw ['stopped'];
-  
-      // Pick a random tile key from mapTiles
-      const keys = Array.from(mapTiles.keys());
-      if (keys.length === 0) throw ['no map'];
-  
-      // Random index
-      const rndKey = keys[Math.floor(Math.random() * keys.length)];
-      const [x, y] = rndKey.split(',').map(Number);
-  
-      this.log('Patrolling → wandering to', { x, y });
-      // Delegate to go_to/A* mechanism
-      await this.subIntention(['go_to', x, y]);
-  
-      if (this.stopped) throw ['stopped'];
-      return true;
-    }
-}  
+
+    // all sectors & tiles tried, give up
+    this.log('Patrolling: all sectors exhausted—aborting patrol');
+    throw ['stopped'];
+  }
+}
 
 class AstarMove extends Plan {
     static isApplicableTo(goal, x, y) {
       return goal === 'go_to';
     }
     async execute(goal, x, y) {
+      const h = n => {
+        const base = Math.abs(n.x - x) + Math.abs(n.y - y);
+        const crowd = Math.min(
+          ...[...agents.values()]
+            .filter(a => a.id !== me.id)
+            .map(a => Math.abs(n.x - a.x) + Math.abs(n.y - a.y))
+        );
+        return base + 0.2 * (1 / (crowd + 1));  // 0.2? needs to be tweaked/fine-tuned
+      };
+    
       const plan = aStarDaemon.aStar(
         { x: me.x, y: me.y },
         { x, y },
-        n => Math.abs(n.x - x) + Math.abs(n.y - y)
+        h
       );
       // console.log('A* plan =', plan);
 
@@ -528,7 +603,12 @@ class BulkCollect extends Plan {
       this.log(`BulkCollect → picking up ${p.id}`);
       const ok = await client.emitPickup();
       if (!ok) {
-        this.log('BulkCollect: pickup failed for', p.id, ', aborting rest');
+        this.log('BulkCollect: pickup failed — discounting', p.id);
+        const q = parcels.get(p.id);
+        if (q) {
+          q.expectedUtility = q.expectedUtility * CONTEST_PENALTY;
+          parcels.set(p.id, q);
+        }
         break;
       }
       parcels.delete(p.id);
@@ -554,72 +634,10 @@ class BulkCollect extends Plan {
   }
 }
 
-class BlindMove extends Plan {
-    static isApplicableTo(goal, x, y) {
-      return goal === 'go_to';
-    }
-  
-    async execute(goal, x, y) {
-      this.log('BlindMove from', me.x, me.y, 'to', { x, y });
-      // track where we came from, so we don't immediately step back
-      let prevPos = null;
-  
-      // keep going until we reach the exact target
-      outer: while (me.x !== x || me.y !== y) {
-        if (this.stopped) throw ['stopped'];
-  
-        // capture current pos so after a successful move we can set prevPos
-        const curr = { x: me.x, y: me.y };
-  
-        // 1) preferred directions toward target
-        const dirAttempts = [];
-        if (x > me.x) dirAttempts.push('right');
-        if (x < me.x) dirAttempts.push('left');
-        if (y > me.y) dirAttempts.push('up');
-        if (y < me.y) dirAttempts.push('down');
-  
-        // 2) fallback: all four directions, in a fixed but secondary order
-        for (const d of ['up','down','left','right']) {
-          if (!dirAttempts.includes(d)) dirAttempts.push(d);
-        }
-  
-        // 3) prune out the move that would take us back to prevPos
-        if (prevPos) {
-          for (let i = dirAttempts.length-1; i >= 0; i--) {
-            const move = dirAttempts[i];
-            let nx = me.x + (move === 'right' ? 1 : move === 'left' ? -1 : 0);
-            let ny = me.y + (move === 'up' ? 1 : move === 'down' ? -1 : 0);
-            if (nx === prevPos.x && ny === prevPos.y) {
-              dirAttempts.splice(i, 1);
-            }
-          }
-        }
-  
-        // 4) try each remaining direction
-        for (const move of dirAttempts) {
-          const status = await client.emitMove(move);
-          if (status) {
-            // success! record where we came from, update me, and re‑loop
-            prevPos = curr;
-            me.x = status.x;
-            me.y = status.y;
-            continue outer;
-          }
-        }
-  
-        // 5) none worked → truly stuck
-        this.log('stuck at', me, 'cannot move toward', { x, y });
-        throw 'stuck';
-      }
-  
-      return true;
-    }
-  }  
-  
+
 
 planLibrary.push(GoPickUp);
 planLibrary.push(Patrolling)
 planLibrary.push(GoDeliver);
 planLibrary.push(AstarMove);
 planLibrary.push(BulkCollect)
-//planLibrary.push(BlindMove);

@@ -1,3 +1,8 @@
+import { mapTiles } from './agent.js';
+
+export const SECTOR_SIZE = 5;
+export const sectorLastVisit = new Map(); // "sx,sy" → timestamp
+
 /**
  * Manhattan distance between two grid points.
  */
@@ -71,4 +76,33 @@ export function combinations(array, k) {
     const withoutHead = combinations(rest, k);
   
     return withHead.concat(withoutHead);
+  }
+  
+  export function markSector(x, y) {
+    const sx = Math.floor(x / SECTOR_SIZE);
+    const sy = Math.floor(y / SECTOR_SIZE);
+    sectorLastVisit.set(`${sx},${sy}`, Date.now());
+  }
+  
+  export function pickOldestSector() {
+    // 1) Scan every walkable tile and ensure its sector has an entry
+    for (const key of mapTiles.keys()) {
+      const [x, y] = key.split(',').map(Number);
+      const sx = Math.floor(x / SECTOR_SIZE);
+      const sy = Math.floor(y / SECTOR_SIZE);
+      const sk = `${sx},${sy}`;
+      if (!sectorLastVisit.has(sk)) sectorLastVisit.set(sk, 0);
+    }
+  
+    // 2) Find the sector with the oldest timestamp
+    let oldestKey = null;
+    let oldestTime = Infinity;
+    for (const [sk, ts] of sectorLastVisit) {
+      if (ts < oldestTime) {
+        oldestTime = ts;
+        oldestKey = sk;
+      }
+    }
+  
+    return oldestKey.split(',').map(Number);
   }
