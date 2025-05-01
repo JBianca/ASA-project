@@ -104,14 +104,11 @@ client.onParcelsSensing(pp => {
     }
   }
 
-  // 3) Finally, if any suspended deliveries are no longer carriedBy you at all,
-  //    un-suspend them (they must’ve been dropped elsewhere).
-  const stillCarried = new Set(
-    pp.filter(p => p.carriedBy === me.id).map(p => p.id)
-  );
-  for (const id of suspendedDeliveries) {
-    if (!stillCarried.has(id)) {
+  for (const id of Array.from(suspendedDeliveries)) {
+    if (!parcels.has(id)) {
+      // it was delivered, stolen, or decayed away
       suspendedDeliveries.delete(id);
+      console.log('[unsuspend]', id);
     }
   }
 });
@@ -207,6 +204,9 @@ const aStarDaemon = new AStarDaemon(mapTiles);
 
 function optionsGeneration() {
   // if the *current* intention is BulkCollect, do nothing (don't replan!)
+  console.log('[opts] all parcels:', [...parcels.keys()]);
+  console.log('[opts] suspended:', Array.from(suspendedDeliveries));
+
   const current = myAgent.intention_queue[0];
   if (current?.predicate[0] === 'bulk_collect') {
     return;
@@ -215,7 +215,27 @@ function optionsGeneration() {
   const options   = [];
   const carried = [...parcels.values()]
     .find(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id));
-  const available = [...parcels.values()].filter(p => !p.carriedBy);
+  const available = [...parcels.values()]
+    .filter(p => !p.carriedBy && !suspendedDeliveries.has(p.id));
+  console.log('[opts] actually available →', available.map(p=>p.id));
+  for (const p of parcels.values()) {
+    if (suspendedDeliveries.has(p.id) && typeof p.id !== 'string') {
+      console.warn('[type-mismatch] suspended has', p.id, 'typeof p.id=', typeof p.id);
+    }
+  }
+
+  const LOCAL_RADIUS = 6;
+  const localCount = available.reduce((cnt, p) => {
+    const d = Math.abs(p.x - me.x) + Math.abs(p.y - me.y);
+    return cnt + (d <= LOCAL_RADIUS ? 1 : 0);
+  }, 0);
+
+  let maxK;
+  if (localCount >= 12)       maxK = 5;
+  else if (localCount >= 8)   maxK = 4;
+  else if (localCount >= 4)   maxK = 3;
+  else if (localCount >= 2)   maxK = 2;
+  else                        maxK = 1;
 
   // 1) If you're carrying something, go deliver.
   if (carried && deliveryZones.length) {
@@ -234,7 +254,7 @@ function optionsGeneration() {
       aStarDaemon,
       PENALTY,
       DECAY_INTERVAL_MS/1000,
-      /*maxK=*/3
+      maxK
     );
 
     if (route.length > 1) {
@@ -402,10 +422,13 @@ class GoPickUp extends Plan {
     try {
       await this.subIntention(['go_to', x, y]);
     } catch (err) {
-      this.log(`GoPickUp: parcel ${id} unreachable — discounting & skipping`);
+      this.log(`GoPickUp: parcel ${id} unreachable — discounting & suspending`);
       const p = parcels.get(id);
       if (p) {
-        p.expectedUtility = p.expectedUtility * CONTEST_PENALTY;
+        // discount its expectedUtility
+        p.expectedUtility *= CONTEST_PENALTY;
+        suspendedDeliveries.add(id);
+        console.log('[suspend] now suspended:', Array.from(suspendedDeliveries));
         parcels.set(id, p);
       }
       throw ['stopped'];
@@ -510,63 +533,53 @@ class Patrolling extends Plan {
 }
 
 class AstarMove extends Plan {
-    static isApplicableTo(goal, x, y) {
-      return goal === 'go_to';
-    }
-    async execute(goal, x, y) {
-      const h = n => {
-        const base = Math.abs(n.x - x) + Math.abs(n.y - y);
-        const crowd = Math.min(
-          ...[...agents.values()]
-            .filter(a => a.id !== me.id)
-            .map(a => Math.abs(n.x - a.x) + Math.abs(n.y - a.y))
-        );
-        return base + 0.2 * (1 / (crowd + 1));  // 0.2? needs to be tweaked/fine-tuned
-      };
-    
-      const plan = aStarDaemon.aStar(
-        { x: me.x, y: me.y },
-        { x, y },
-        h
-      );
-      // console.log('A* plan =', plan);
+  static isApplicableTo(goal, x, y) {
+    return goal === 'go_to';
+  }
+  async execute(goal, x, y) {
+    const plan = aStarDaemon.aStar(
+      { x: me.x, y: me.y },
+      { x, y },
+      n => Math.abs(n.x - x) + Math.abs(n.y - y)
+    );
+    // console.log('A* plan =', plan);
 
-      if (plan === 'failure' || !Array.isArray(plan) || plan.length === 0) {
-        this.log('AstarMove: no path found → aborting to replan/fallback');
-        throw ['stopped']; 
-      }
-  
-      for (const step of plan) {
-        if (this.stopped) throw ['stopped'];
-  
-        // DEBUG
-        const key = `${step.x},${step.y}`;
-        console.log(
-          '→ next step', step,
-          'mapTiles.has=', mapTiles.has(key),
-          'tile=', mapTiles.get(key)
-        );
-  
-        // locked‐tile check
-        const tile = mapTiles.get(key);
-        if (tile?.locked) {
-          console.log('  aborting because locked → replanning');
-          throw ['stopped'];
-        }
-  
-        const status = await client.emitMove(step.action);
-        console.log('  emitMove returned', status);
-        if (!status) {
-          console.log('  blocked by wall or collision → replanning');
-          throw ['stopped'];
-        }
-  
-        me.x = status.x;
-        me.y = status.y;
-      }
-  
-      return true;
+    if (plan === 'failure' || !Array.isArray(plan) || plan.length === 0) {
+      this.log('AstarMove: no path found → aborting to replan/fallback');
+      throw ['stopped']; 
     }
+
+    for (const step of plan) {
+      if (this.stopped) throw ['stopped'];
+
+      // DEBUG
+      const key = `${step.x},${step.y}`;
+      console.log(
+        '→ next step', step,
+        'mapTiles.has=', mapTiles.has(key),
+        'tile=', mapTiles.get(key)
+      );
+
+      // locked‐tile check
+      const tile = mapTiles.get(key);
+      if (tile?.locked) {
+        console.log('  aborting because locked → replanning');
+        throw ['stopped'];
+      }
+
+      const status = await client.emitMove(step.action);
+      console.log('  emitMove returned', status);
+      if (!status) {
+        console.log('  blocked by wall or collision → replanning');
+        throw ['stopped'];
+      }
+
+      me.x = status.x;
+      me.y = status.y;
+    }
+
+    return true;
+  }
 }
 
 class BulkCollect extends Plan {
