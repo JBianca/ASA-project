@@ -214,7 +214,8 @@ function optionsGeneration() {
   console.log('[opts] all parcels:', [...parcels.keys()]);
   console.log('[opts] suspended:', Array.from(suspendedDeliveries));
 
-  if (myAgent.intention_queue.length > 0) {
+  const current = myAgent.intention_queue[0];
+  if (current && current.predicate[0] !== 'patrolling') {
     return;
   }
 
