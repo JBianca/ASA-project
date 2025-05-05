@@ -557,6 +557,28 @@ class AstarMove extends Plan {
     for (const step of plan) {
       if (this.stopped) throw ['stopped'];
 
+      // --- NEW: Check for parcels/delivery on current tile BEFORE moving ---
+      const currentParcel = [...parcels.values()].find(p => 
+        p.x === me.x && p.y === me.y && !p.carriedBy
+      );
+      
+      // 1) Opportunistic pickup
+      if (currentParcel && !currentParcel.carriedBy) {
+        console.log('Found parcel underfoot during move → picking up');
+        await client.emitPickup();
+      }
+
+      // 2) Opportunistic delivery
+      if (deliveryZones.some(z => z.x === me.x && z.y === me.y)) {
+        const carried = [...parcels.values()].filter(p => 
+          p.carriedBy === me.id
+        );
+        if (carried.length > 0) {
+          console.log('On delivery zone during move → dropping parcels');
+          await client.emitPutdown();
+        }
+      }
+
       // DEBUG
       const key = `${step.x},${step.y}`;
       console.log(
