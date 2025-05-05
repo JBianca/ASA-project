@@ -290,6 +290,50 @@ client.onParcelsSensing(optionsGeneration);
 client.onAgentsSensing(optionsGeneration);
 client.onYou(optionsGeneration);
 
+class Intention {
+  #current_plan;
+  #stopped = false;
+  #started = false;
+  #parent;
+  #predicate;
+
+  constructor(parent, predicate) {
+      this.#parent = parent;
+      this.#predicate = predicate;
+  }
+
+  get stopped() { return this.#stopped; }
+  get predicate() { return this.#predicate; }
+
+  stop() {
+      this.#stopped = true;
+      if (this.#current_plan) this.#current_plan.stop();
+  }
+
+  log(...args) {
+      if (this.#parent?.log)
+          this.#parent.log('\t', ...args);
+      else
+          console.log(...args);
+  }
+
+  async achieve() {
+      if (this.#started) return this;
+      this.#started = true;
+      for (const planClass of planLibrary) {
+          if (this.stopped) throw ['stopped intention', ...this.predicate];
+          if (planClass.isApplicableTo(...this.predicate)) {
+              this.#current_plan = new planClass(this.#parent);
+              try {
+                  return await this.#current_plan.execute(...this.predicate);
+              } catch (error) {}
+          }
+      }
+      if (this.stopped) throw ['stopped intention', ...this.predicate];
+      throw ['no plan satisfied the intention', ...this.predicate];
+  }
+}
+
 class IntentionRevision {
     #intention_queue = [];
     get intention_queue() {
@@ -307,6 +351,9 @@ class IntentionRevision {
                 }
                 await intention.achieve().catch(() => {});
                 this.intention_queue.shift();
+            } else {
+              // queue empty → pick a new intention immediately
+              optionsGeneration();
             }
             await new Promise(res => setImmediate(res));
         }
@@ -329,50 +376,6 @@ class IntentionRevisionReplace extends IntentionRevision {
 
 const myAgent = new IntentionRevisionReplace();
 myAgent.loop();
-
-class Intention {
-    #current_plan;
-    #stopped = false;
-    #started = false;
-    #parent;
-    #predicate;
-
-    constructor(parent, predicate) {
-        this.#parent = parent;
-        this.#predicate = predicate;
-    }
-
-    get stopped() { return this.#stopped; }
-    get predicate() { return this.#predicate; }
-
-    stop() {
-        this.#stopped = true;
-        if (this.#current_plan) this.#current_plan.stop();
-    }
-
-    log(...args) {
-        if (this.#parent?.log)
-            this.#parent.log('\t', ...args);
-        else
-            console.log(...args);
-    }
-
-    async achieve() {
-        if (this.#started) return this;
-        this.#started = true;
-        for (const planClass of planLibrary) {
-            if (this.stopped) throw ['stopped intention', ...this.predicate];
-            if (planClass.isApplicableTo(...this.predicate)) {
-                this.#current_plan = new planClass(this.#parent);
-                try {
-                    return await this.#current_plan.execute(...this.predicate);
-                } catch (error) {}
-            }
-        }
-        if (this.stopped) throw ['stopped intention', ...this.predicate];
-        throw ['no plan satisfied the intention', ...this.predicate];
-    }
-}
 
 const planLibrary = [];
 
@@ -416,32 +419,46 @@ class GoPickUp extends Plan {
   async execute(goal, x, y, id) {
     if (this.stopped) throw ['stopped'];
 
-    // If we're already standing on the parcel, pick it up right away.
+    // 0) already standing on the target?
     if (me.x === x && me.y === y) {
-      this.log('GoPickUp: already on parcel, picking up');
-      await client.emitPickup();
-      if (this.stopped) throw ['stopped'];
+      this.log(`GoPickUp: already on parcel ${id}, attempting pickup`);
+      const ok = await client.emitPickup();
+      if (!ok) {
+        this.log(`GoPickUp: no parcel ${id} here → removing`);
+        parcels.delete(id);
+        suspendedDeliveries.delete(id);
+        throw ['stopped'];
+      }
+      // success!
+      parcels.delete(id);
+      suspendedDeliveries.delete(id);
       return true;
     }
 
+    // 1) otherwise walk to it once
     try {
+      this.log(`GoPickUp → moving to parcel ${id} @(${x},${y})`);
       await this.subIntention(['go_to', x, y]);
-    } catch (err) {
-      this.log(`GoPickUp: parcel ${id} unreachable — discounting & suspending`);
-      const p = parcels.get(id);
-      if (p) {
-        // discount its expectedUtility
-        p.expectedUtility *= CONTEST_PENALTY;
-        suspendedDeliveries.add(id);
-        console.log('[suspend] now suspended:', Array.from(suspendedDeliveries));
-        parcels.set(id, p);
-      }
+    } catch {
+      this.log(`GoPickUp: parcel ${id} unreachable — removing`);
+      parcels.delete(id);
+      suspendedDeliveries.delete(id);
       throw ['stopped'];
     }
 
-    await client.emitPickup();
-    if (this.stopped) throw ['stopped'];
+    // 2) try the pickup
+    this.log(`GoPickUp → picking up parcel ${id}`);
+    const ok = await client.emitPickup();
+    if (!ok) {
+      this.log(`GoPickUp: pickup failed for ${id} — removing`);
+      parcels.delete(id);
+      suspendedDeliveries.delete(id);
+      throw ['stopped'];
+    }
 
+    // 3) success!
+    parcels.delete(id);
+    suspendedDeliveries.delete(id);
     return true;
   }
 }
