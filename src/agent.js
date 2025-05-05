@@ -198,6 +198,13 @@ client.onAgentsSensing(sensedAgents => {
     }
     p.contested = contested;
   }
+
+  for (const p of parcels.values()) {
+    if (!p.contested && suspendedDeliveries.has(p.id)) {
+      suspendedDeliveries.delete(p.id);
+      console.log('[unsuspend]', p.id, 'no longer contested');
+    }
+  }
 });
 
 const aStarDaemon = new AStarDaemon(mapTiles);
@@ -207,8 +214,7 @@ function optionsGeneration() {
   console.log('[opts] all parcels:', [...parcels.keys()]);
   console.log('[opts] suspended:', Array.from(suspendedDeliveries));
 
-  const current = myAgent.intention_queue[0];
-  if (current?.predicate[0] === 'bulk_collect') {
+  if (myAgent.intention_queue.length > 0) {
     return;
   }
 
@@ -246,7 +252,6 @@ function optionsGeneration() {
   }
   else if (available.length > 0) {
     // 2) Compute the optimal batch (size up to 3)
-    // TODO: think about how to set this dynimically?
     const { netUtil, route } = selectOptimalBatch(
       available,
       { x: me.x, y: me.y },
