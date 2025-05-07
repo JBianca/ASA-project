@@ -525,11 +525,14 @@ class Patrolling extends Plan {
       for (const key of mapTiles.keys()) {
         const [x, y] = key.split(',').map(Number);
         if (x >= x0 && x < x0 + SECTOR_SIZE
-         && y >= y0 && y < y0 + SECTOR_SIZE) {
-          candidates.push({ x, y });
+          && y >= y0 && y < y0 + SECTOR_SIZE) {
+          const tile = mapTiles.get(key);
+          // Filter for type 1 tiles ---
+          if (tile.type === 1) {
+            candidates.push({ x, y });
+          }
         }
       }
-      if (candidates.length === 0) continue;  // weird empty sector
 
       // try up to MAX_TILES_PER_SECTOR random picks
       for (let tTry = 1; tTry <= MAX_TILES_PER_SECTOR; tTry++) {
