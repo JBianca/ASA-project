@@ -211,8 +211,8 @@ const aStarDaemon = new AStarDaemon(mapTiles);
 
 function optionsGeneration() {
   // if the *current* intention is BulkCollect, do nothing (don't replan!)
-  console.log('[opts] all parcels:', [...parcels.keys()]);
-  console.log('[opts] suspended:', Array.from(suspendedDeliveries));
+  // console.log('[opts] all parcels:', [...parcels.keys()]);
+  // console.log('[opts] suspended:', Array.from(suspendedDeliveries));
 
   const current = myAgent.intention_queue[0];
   if (current && current.predicate[0] !== 'patrolling') {
@@ -224,7 +224,7 @@ function optionsGeneration() {
     .find(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id));
   const available = [...parcels.values()]
     .filter(p => !p.carriedBy && !suspendedDeliveries.has(p.id));
-  console.log('[opts] actually available →', available.map(p=>p.id));
+  // console.log('[opts] actually available →', available.map(p=>p.id));
   for (const p of parcels.values()) {
     if (suspendedDeliveries.has(p.id) && typeof p.id !== 'string') {
       console.warn('[type-mismatch] suspended has', p.id, 'typeof p.id=', typeof p.id);
@@ -237,12 +237,12 @@ function optionsGeneration() {
     return cnt + (d <= LOCAL_RADIUS ? 1 : 0);
   }, 0);
 
-  let maxK;
-  if (localCount >= 12)       maxK = 5;
-  else if (localCount >= 8)   maxK = 4;
-  else if (localCount >= 4)   maxK = 3;
-  else if (localCount >= 2)   maxK = 2;
-  else                        maxK = 1;
+  // let maxK;
+  // if (localCount >= 12)       maxK = 5;
+  // else if (localCount >= 8)   maxK = 4;
+  // else if (localCount >= 4)   maxK = 3;
+  // else if (localCount >= 2)   maxK = 2;
+  // else                        maxK = 1;
 
   // 1) If you're carrying something, go deliver.
   if (carried && deliveryZones.length) {
@@ -260,7 +260,7 @@ function optionsGeneration() {
       aStarDaemon,
       PENALTY,
       DECAY_INTERVAL_MS/1000,
-      maxK
+      localCount
     );
 
     if (route.length > 1) {
@@ -602,11 +602,11 @@ class AstarMove extends Plan {
 
       // DEBUG
       const key = `${step.x},${step.y}`;
-      console.log(
-        '→ next step', step,
-        'mapTiles.has=', mapTiles.has(key),
-        'tile=', mapTiles.get(key)
-      );
+      // console.log(
+      //   '→ next step', step,
+      //   'mapTiles.has=', mapTiles.has(key),
+      //   'tile=', mapTiles.get(key)
+      // );
 
       // locked‐tile check
       const tile = mapTiles.get(key);
@@ -616,7 +616,7 @@ class AstarMove extends Plan {
       }
 
       const status = await client.emitMove(step.action);
-      console.log('  emitMove returned', status);
+      // console.log('  emitMove returned', status);
       if (!status) {
         console.log('  blocked by wall or collision → replanning');
         throw ['stopped'];

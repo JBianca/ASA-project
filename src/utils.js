@@ -86,23 +86,27 @@ export function combinations(array, k) {
   
   export function pickOldestSector() {
     // 1) Scan every walkable tile and ensure its sector has an entry
+    const tile1Sectors = new Set();
     for (const key of mapTiles.keys()) {
       const [x, y] = key.split(',').map(Number);
-      const sx = Math.floor(x / SECTOR_SIZE);
-      const sy = Math.floor(y / SECTOR_SIZE);
-      const sk = `${sx},${sy}`;
-      if (!sectorLastVisit.has(sk)) sectorLastVisit.set(sk, 0);
+      const tile = mapTiles.get(key);
+      if (tile.type === 1) {
+        const sx = Math.floor(x / SECTOR_SIZE);
+        const sy = Math.floor(y / SECTOR_SIZE);
+        tile1Sectors.add(`${sx},${sy}`);
+      }
     }
-  
-    // 2) Find the sector with the oldest timestamp
+
+    // 2) Find the sector with the oldest timestamp *among tile1 sectors*
     let oldestKey = null;
     let oldestTime = Infinity;
-    for (const [sk, ts] of sectorLastVisit) {
+    for (const sk of tile1Sectors) {
+      const ts = sectorLastVisit.get(sk) ?? 0;
       if (ts < oldestTime) {
         oldestTime = ts;
         oldestKey = sk;
       }
     }
-  
+
     return oldestKey.split(',').map(Number);
   }
