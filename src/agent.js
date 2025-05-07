@@ -16,6 +16,7 @@ const CONTEST_RADIUS = 3;    // Manhattan distance threshold
 const CONTEST_PENALTY = 0.5;  // 50% discount on contested parcels
 const MAX_SECTORS_TO_TRY = 5;
 const MAX_TILES_PER_SECTOR = 10;
+const SCOUT_STEPS = 5;    // scouting steps around parcel-spawning tiles
 
 const suspendedDeliveries = new Set();
 
@@ -534,6 +535,11 @@ class Patrolling extends Plan {
         }
       }
 
+      if (candidates.length === 0) {
+        this.log(`Patrolling: sector ${sx},${sy} has no spawn-tiles, skipping…`);
+        continue;
+      }
+
       // try up to MAX_TILES_PER_SECTOR random picks
       for (let tTry = 1; tTry <= MAX_TILES_PER_SECTOR; tTry++) {
         if (this.stopped) throw ['stopped'];
@@ -542,7 +548,30 @@ class Patrolling extends Plan {
         this.log(`Patrolling → sector ${sx},${sy} → attempt ${tTry} @ (${x},${y})`);
         try {
           await this.subIntention(['go_to', x, y]);
-          return true;  // success—keep patrolling until you’re stopped externally
+          
+          const dirs = [{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+          for (let i = 0; i < SCOUT_STEPS; i++) {
+            if (this.stopped) throw ['stopped'];
+            const {dx,dy} = dirs[Math.floor(Math.random()*4)];
+            const nx = me.x + dx, ny = me.y + dy;
+            const key = `${nx},${ny}`, tile = mapTiles.get(key);
+            if (!tile.locked) {
+              try {
+                this.log(`scouting → (${nx},${ny})`);
+                await this.subIntention(['go_to', nx, ny]);
+              } catch {
+                this.log(`blocked @ (${nx},${ny}), stay put`);
+              }
+            } else {
+              this.log(`skip invalid (${nx},${ny})`);
+            }
+            // small pause so you don’t zip instantly:
+            await new Promise(r => setTimeout(r, 200));
+          }
+
+          this.log('Patrolling: scouting done, ready for next sector');
+          return true;
+
         } catch {
           this.log(`  Patrolling: (${x},${y}) blocked, retrying…`);
           // immediate retry; no setTimeout
