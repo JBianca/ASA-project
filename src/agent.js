@@ -1,4 +1,4 @@
-import { DeliverooApi } from "@unitn-asa/deliveroo-js-client";
+import { DeliverooApi, ioClientSocket } from "@unitn-asa/deliveroo-js-client";
 import config from "../config.js";
 import AStarDaemon from "./astar_daemon.js";
 import { distance, pickOldestSector, markSector, SECTOR_SIZE } from './utils.js';
@@ -12,11 +12,11 @@ const client = new DeliverooApi(
 let PENALTY;
 let DECAY_INTERVAL_MS;
 
-const CONTEST_RADIUS = 3;    // Manhattan distance threshold
-const CONTEST_PENALTY = 0.5;  // 50% discount on contested parcels
+const CONTEST_RADIUS = 3;         // Manhattan distance threshold
+const CONTEST_PENALTY = 0.5;      // 50% discount on contested parcels
 const MAX_SECTORS_TO_TRY = 5;
 const MAX_TILES_PER_SECTOR = 10;
-const SCOUT_STEPS = 5;    // scouting steps around parcel-spawning tiles
+const SCOUT_STEPS = 5;            // scouting steps around parcel-spawning tiles
 
 const suspendedDeliveries = new Set();
 
@@ -238,13 +238,6 @@ function optionsGeneration() {
     return cnt + (d <= LOCAL_RADIUS ? 1 : 0);
   }, 0);
 
-  // let maxK;
-  // if (localCount >= 12)       maxK = 5;
-  // else if (localCount >= 8)   maxK = 4;
-  // else if (localCount >= 4)   maxK = 3;
-  // else if (localCount >= 2)   maxK = 2;
-  // else                        maxK = 1;
-
   // 1) If you're carrying something, go deliver.
   if (carried && deliveryZones.length) {
     const dz = deliveryZones.reduce((a, b) =>
@@ -253,8 +246,8 @@ function optionsGeneration() {
     options.push(['go_deliver', dz.x, dz.y]);
   }
   else if (available.length > 0) {
-    // 2) Compute the optimal batch (size up to 3)
-    const { netUtil, route } = selectOptimalBatch(
+    // 2) Try bulk first…
+    const batchResult = selectOptimalBatch(
       available,
       { x: me.x, y: me.y },
       deliveryZones,
@@ -263,20 +256,47 @@ function optionsGeneration() {
       DECAY_INTERVAL_MS/1000,
       localCount
     );
-
-    if (route.length > 1) {
-      // multi‐pickup run
-      // pass the parcel IDs as arguments
-      options.push(['bulk_collect', ...route.map(p => p.id)]);
+  
+    if (
+      batchResult &&
+      Array.isArray(batchResult.route) &&
+      batchResult.route.length > 0
+    ) {
+      const { route } = batchResult;
+      if (route.length > 1) {
+        options.push(['bulk_collect', ...route.map(p => p.id)]);
+      } else {
+        const p = route[0];
+        options.push(['go_pick_up', p.x, p.y, p.id]);
+      }
     }
     else {
-      // single‐pickup run
-      const p = route[0];
-      options.push(['go_pick_up', p.x, p.y, p.id]);
+      console.warn('bulk plan failed → falling back to single‐pickup');
+      // 3) Fallback: try each parcel individually (by nearest first)
+      const byDist = available
+        .slice()
+        .sort((a,b)=> distance(me,a) - distance(me,b));
+      let found = false;
+      for (const p of byDist) {
+        const singleRoute = aStarDaemon.aStar(
+           { x: me.x, y: me.y },
+           { x: p.x, y: p.y },
+           n => Math.abs(n.x - p.x) + Math.abs(n.y - p.y)
+        );
+        if (Array.isArray(singleRoute) && singleRoute.length > 0) {
+          options.push(['go_pick_up', p.x, p.y, p.id]);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        console.warn('no single parcel reachable → patrol');
+        options.push(['patrolling']);
+      }
     }
   }
   else {
-    // 3) Nothing to do: patrol
+    // Nothing to do: patrol
     options.push(['patrolling']);
   }
 
