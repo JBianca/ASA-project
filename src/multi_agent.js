@@ -139,7 +139,7 @@ client.onParcelsSensing(async (pp) => {
     if (!parcels.has(id)) {
       // it was delivered, stolen, or decayed away
       suspendedDeliveries.delete(id);
-      console.log('[unsuspend]', id);
+      // console.log('[unsuspend]', id);
     }
   }
 
@@ -398,7 +398,8 @@ class Intention {
       if (this.#parent?.log)
           this.#parent.log('\t', ...args);
       else
-          console.log(...args);
+          void 0
+          // console.log(...args);
   }
 
   async achieve() {
@@ -419,9 +420,9 @@ class Intention {
 }
 
 class IntentionRevision {
-    #intention_queue = [];
+    _intention_queue = [];
     get intention_queue() {
-        return this.#intention_queue;
+        return this._intention_queue;
     }
 
     async loop() {
@@ -444,18 +445,63 @@ class IntentionRevision {
     }
 
     log(...args) {
-        console.log(...args);
+        // console.log(...args);
     }
 }
 
 class IntentionRevisionReplace extends IntentionRevision {
-    async push(predicate) {
-        const last = this.intention_queue.at(-1);
-        if (last && last.predicate.join(' ') == predicate.join(' ')) return;
-        const intention = new Intention(this, predicate);
-        this.intention_queue.push(intention);
-        if (last) last.stop();
+  // Keep track when the last intention was added
+  #lastPushTime = 0;
+
+  // Do not add new intention more than once in - second
+  COOLDOWN_MS = 1000; // 1 second cooldown
+
+   /**
+   * Add a new goal  to the list.
+   * If it's the same as the last one, or if it's too soon, do nothing.
+   */
+  async push(predicate) {
+    // Less than 1 second since the last push, skip it
+    if (Date.now() - this.#lastPushTime < this.COOLDOWN_MS) return;
+
+    // Update the last push time to now
+    this.#lastPushTime = Date.now();
+
+    // Get the most recent intention from the list
+    const last = this.intention_queue.at(-1);
+
+    // If the new goal is exactly the same as the last one, skip it
+    if (last && last.predicate.join(' ') == predicate.join(' ')) return;
+
+    // Create and push a new intention
+    const intention = new Intention(this, predicate);
+    this.intention_queue.push(intention);
+
+    // If there was a previous intention, stop it so we only follow one at a time
+    if (last) last.stop();
+  }
+
+  
+  // If the agent hasn't done anything for too long, it resets intentions to recover
+  async loop() {
+    const STUCK_THRESHOLD = 3000; // 3 seconds of inactivity before reset
+    let lastActionTime = Date.now();
+
+    while (true) {
+      // If too much time has passed without any change, assume we're stuck and clear intentions
+      if (Date.now() - lastActionTime > STUCK_THRESHOLD) {
+        console.log('Force resetting intentions due to inactivity');
+        this._intention_queue = [];
+        optionsGeneration(); // regenerate available options
+      }
+
+      // Reset the timer 
+      lastActionTime = Date.now();
+
+      // Allow the rest of the program to run
+      await new Promise(res => setImmediate(res));
     }
+  }
 }
 
 const myAgent = new IntentionRevisionReplace();
@@ -485,7 +531,8 @@ class Plan {
         if (this.#parent?.log)
             this.#parent.log('\t', ...args);
         else
-            console.log(...args);
+            void O
+            // console.log(...args);
     }
 
     async subIntention(predicate) {
@@ -673,7 +720,7 @@ class Patrolling extends Plan {
               this.log(`skip invalid (${nx},${ny})`);
             }
             // small pause so you don’t zip instantly:
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 50));
           }
 
           this.log('Patrolling: scouting done, ready for next sector');
@@ -700,87 +747,130 @@ class AstarMove extends Plan {
   }
 
   async execute(goal, targetX, targetY) {
+    const MAX_RETRIES = 4;              // Max times to replan the full path
+    const Max_LOCK_WAIT = 4;            // Max num of short waits if a tile is locked
+    const STEP_CONFIRM_TIMEOUT = 4;     // Max attempts to confirm that the agent moved
+
     let currentX = me.x;
     let currentY = me.y;
-    let attempts = 0;
-    const MAX_ATTEMPTS = 3;
+    let retries = 0;
 
-    while (attempts < MAX_ATTEMPTS) {
+    while (retries < MAX_RETRIES) {
+
       const plan = aStarDaemon.aStar(
         { x: currentX, y: currentY },
         { x: targetX, y: targetY },
-        n => Math.abs(n.x - targetX) + Math.abs(n.y - targetY)
+        n => {
+          const tile = mapTiles.get(`${n.x},${n.y}`);
+          // Heuristic: Manhattan distance + penalty if tile is currently locked
+          return Math.abs(n.x - targetX) + Math.abs(n.y - targetY) + (tile?.locked ? 15 : 0);
+        }
       );
 
-      if (plan === "failure" || !Array.isArray(plan) || plan.length === 0) {
-        this.log(`AstarMove: no path found (attempt ${attempts + 1})`);
-        attempts++;
-        await sleep(500);
+      if (!plan || plan === 'failure' || plan.length === 0) {
+        this.log(`AstarMove: No path to (${targetX}, ${targetY}) [retry ${retries + 1}]`);
+        retries++;
+        await sleep(300 + Math.random() * 200); // Prevent sync retries
         continue;
       }
 
       for (const step of plan) {
         if (this.stopped) throw ['stopped'];
 
-        // Check for dynamic obstacles before moving
-        const tile = mapTiles.get(`${step.x},${step.y}`);
-        if (tile?.locked || tile?.type === 0) {
-          this.log('Detected new obstacle → replanning');
-          attempts++;
-          await sleep(200);
-          break; // Break out of step loop to replan
+        const tileKey = `${step.x},${step.y}`;
+        const tile = mapTiles.get(tileKey);
+
+        // Wait a few cycles if the tile is locked
+        let lockWaits = 0;
+        while (tile?.locked && lockWaits++ < MAX_LOCK_WAIT) {
+          await sleep(30 + Math.random() * 50);
         }
 
-        // Attempt movement
+        // If still locked, penalize tile and continue with the rest of the plan
+        if (tile?.locked) {
+          aStarDaemon.addTempPenalty(step.x, step.y, 10);
+          await sleep(30 + Math.random() * 50);
+          continue;
+        }
+
         try {
-          const status = await client.emitMove(step.action);
-          if (!status) {
-            this.log('Movement blocked → replanning');
-            attempts++;
-            await sleep(200);
+          const beforeX = me.x;
+          const beforeY = me.y;
+
+          // If coordination assignment was lost, skip this step
+          if (pickupCoordination[id] !== me.id) {
+            this.log('Coordination lost → skipping move, not aborting');
+            await sleep(100); // Let coordination resolve
+            continue;
+          }
+
+          // Attempt the move
+          const moveResult = await client.emitMove(step.action);
+
+          if (!moveResult) {
+            this.log(`AstarMove: Move blocked (action: ${step.action})`);
+            retries++;
+            break; // Replan if move was denied
+          }
+
+          // Wait to confirm movement was successful
+          let confirmed = false;
+          for (let i = 0; i < STEP_CONFIRM_TIMEOUT; i++) {
+            await sleep(20);
+            if (me.x !== beforeX || me.y !== beforeY) {
+              confirmed = true;
+              break;
+            }
+          }
+
+          // If not move, trigger replanning
+          if (!confirmed) {
+            this.log('AstarMove: Move unconfirmed → aborting path');
+            retries++;
             break;
           }
-          
-          // Update current position
-          currentX = status.x;
-          currentY = status.y;
-          me.x = currentX;
-          me.y = currentY;
 
-          // Check for opportunistic actions
+          // Update current position
+          currentX = me.x;
+          currentY = me.y;
+
           await this.checkOpportunisticActions();
-          
-        } catch (error) {
-          this.log('Movement error → replanning');
-          attempts++;
-          await sleep(200);
+
+          // Exit early if target reached
+          if (currentX === targetX && currentY === targetY) {
+            return true;
+          }
+
+        } catch (err) {
+          this.log('AstarMove: Exception during move → skipping step');
+          retries++;
           break;
         }
       }
-
-      // If we completed all steps successfully
-      if (currentX === targetX && currentY === targetY) {
-        return true;
-      }
     }
 
-    this.log('AstarMove: max replan attempts reached → aborting');
+    // Too many retries, give up
+    this.log('AstarMove: Max retries reached → aborting');
     throw ['stopped'];
   }
 
   async checkOpportunisticActions() {
-    // Existing opportunistic pickup/delivery logic
-    const currentParcel = [...parcels.values()].find(p => 
-      p.x === me.x && p.y === me.y && !p.carriedBy
-    );
-    
-    if (currentParcel) {
-      console.log('Opportunistic pickup');
-      await client.emitPickup();
+    // Get all parcels currently carried
+    const carried = [...parcels.values()].filter(p => p.carriedBy === me.id);
+
+    // Opportunistically pick up parcel at current location if reward is still good
+    if (carried.length < 3) {
+      const parcelHere = [...parcels.values()].find(p =>
+        p.x === me.x && p.y === me.y && !p.carriedBy
+      );
+      if (parcelHere && parcelHere.reward > 5) {
+        console.log('Opportunistic pickup');
+        await client.emitPickup();
+      }
     }
 
+    // Opportunistically deliver if standing on a delivery zone
     if (deliveryZones.some(z => z.x === me.x && z.y === me.y)) {
-      const carried = [...parcels.values()].filter(p => p.carriedBy === me.id);
       if (carried.length > 0) {
         console.log('Opportunistic delivery');
         await client.emitPutdown();
