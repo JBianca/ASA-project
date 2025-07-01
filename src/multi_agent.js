@@ -9,7 +9,6 @@ const host = args.host;
 const token = args.token;
 const teamMateId= args.teamId;
 
-var currentIntention = null;
 var pickupCoordination = {};
 
 const client = new DeliverooApi(host, token);
@@ -27,23 +26,36 @@ const suspendedDeliveries = new Set();
 
 client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
-  DECAY_INTERVAL_MS = parseInt(cfg.PARCEL_DECAYING_INTERVAL) * 1000;
+  DECAY_INTERVAL_MS = parseInt(cfg.PARCEL_DECADING_INTERVAL) * 1000;
 });
 
 const me = {id: null, name: null, x: null, y: null, score: null};
+let lastSeenMate = null;
 
 client.onYou(({id, name, x, y, score}) => {
     me.id = id;
     me.name = name;
-    // console.log(`[${name}] Connected with ID: ${id}`);
+    // console.log([${name}] Connected with ID: ${id});
     me.x = x;
     me.y = y;
     me.score = score;
 });
 
+setInterval(() => {
+  client.emitSay(teamMateId, {
+    action: 'position_update',
+    x: me.x,
+    y: me.y
+  });
+}, 1000);
+
 // add function to exchange message between teammate
 client.onMsg(async (id, name, msg, reply) => {
-  //console.log(`Received message from ${name}:`, msg);
+  //console.log(Received message from ${name}:, msg);
+  if (msg.action === 'position_update') {
+    lastSeenMate = { x: msg.x, y: msg.y };
+    return;
+  }
 
   if (msg.action === 'parcel_snapshot') {
     const now = Date.now();
@@ -58,7 +70,7 @@ client.onMsg(async (id, name, msg, reply) => {
       parcels.set(p.id, {
         ...existing,
         ...p,    // update x,y,reward,carriedBy
-        spawnTime: existing.spawnTime ?? now,
+        spawnTime:     existing.spawnTime ?? now,
         initialReward: existing.initialReward ?? p.reward,
         lastSeen: existing.lastSeen ?? p.lastSeen ?? now,
         expectedUtility: contested
@@ -228,6 +240,9 @@ const agents = new Map();
 client.onAgentsSensing(sensedAgents => {
   for (const a of sensedAgents) {
     agents.set(a.id, { id: a.id, x: a.x, y: a.y, score: a.score });
+    if (a.id === teamMateId) {
+      lastSeenMate = { x: a.x, y: a.y };
+    }
   }
 
   const seenIds = new Set(sensedAgents.map(a => a.id));
@@ -295,7 +310,7 @@ const PARCEL_TTL = 30_000;     // how long we keep “shared” drops
 
 function assignParcelsToMe() {
   const assigned = new Set();
-  const mate = agents.get(teamMateId);
+  const matePos = agents.get(teamMateId) || lastSeenMate;
 
   // 0) prune any old private‐claim entries
   const CLAIM_TTL = 10_000;
@@ -323,12 +338,18 @@ function assignParcelsToMe() {
 
     // 3) compute net utilities
     const myCost = estimateCost({ x: me.x,      y: me.y }, p);
-    const theirCost = mate
-      ? estimateCost({ x: mate.x,    y: mate.y }, p)
+    const theirCost = matePos
+      ? estimateCost({ x: matePos.x, y: matePos.y }, p)
       : Infinity;
 
     const myNet = p.expectedUtility - PENALTY * ( myCost    / (DECAY_INTERVAL_MS/1000) );
     const theirNet = p.expectedUtility - PENALTY * ( theirCost / (DECAY_INTERVAL_MS/1000) );
+
+    //console.log(
+      //`[assign] parcel ${id}: reward=${p.expectedUtility.toFixed(1)}, `,
+      //`myCost=${myCost.toFixed(1)}, theirCost=${theirCost.toFixed(1)}, `,
+      //`myNet=${myNet.toFixed(2)}, theirNet=${theirNet.toFixed(2)}`
+    //);
 
     if (myNet > theirNet) {
       assigned.add(id);
@@ -736,10 +757,10 @@ class GoDeliver extends Plan {
           await client.emitPutdown();  // drop one by one if you like
           return true;
         } catch (_) {
-          this.log(`  GoDeliver: blocked at (${dz.x},${dz.y}) on attempt ${attempt}`);
+          this.log(  `GoDeliver: blocked at (${dz.x},${dz.y}) on attempt ${attempt}`);
         }
       }
-      this.log(`  GoDeliver: giving up on zone (${dz.x},${dz.y}), trying next`);
+      this.log(  `GoDeliver: giving up on zone (${dz.x},${dz.y}), trying next`);
     }
 
     // if we get here, *all* zones failed → suspend these parcels
@@ -816,7 +837,7 @@ class Patrolling extends Plan {
           return true;
 
         } catch {
-          this.log(`  Patrolling: (${x},${y}) blocked, retrying…`);
+          this.log(  `Patrolling: (${x},${y}) blocked, retrying…`);
           // immediate retry; no setTimeout
         }
       }
@@ -837,7 +858,7 @@ class AstarMove extends Plan {
 
   async execute(goal, targetX, targetY, parcelId) {
     const MAX_RETRIES = 4;              // Max times to replan the full path
-    const Max_LOCK_WAIT = 4;            // Max num of short waits if a tile is locked
+    const MAX_LOCK_WAIT = 4;            // Max num of short waits if a tile is locked
     const STEP_CONFIRM_TIMEOUT = 4;     // Max attempts to confirm that the agent moved
 
     let currentX = me.x;
@@ -882,7 +903,7 @@ class AstarMove extends Plan {
 
         // If still locked, penalize tile and continue with the rest of the plan
         if (tile?.locked) {
-          aStarDaemon.addTempPenalty(step.x, step.y, 10);
+          aStarDaemon.addTempPenalty(step.x, step.y, 10);   //TODO: implement this!
           await sleep(30 + Math.random() * 50);
           continue;
         }
@@ -1037,4 +1058,4 @@ planLibrary.push(GoPickUp);
 planLibrary.push(Patrolling)
 planLibrary.push(GoDeliver);
 planLibrary.push(AstarMove);
-planLibrary.push(BulkCollect)
+planLibrary.push(BulkCollect);

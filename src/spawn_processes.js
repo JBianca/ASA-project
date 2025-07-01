@@ -1,11 +1,11 @@
 // import child_process in ES module
 import { spawn } from 'child_process';
 
-const nance = { id: 'e083aa6f59e', name: 'nance',
+const nance = { id: '166aab', name: 'nance',
 token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjE2NmFhYiIsIm5hbWUiOiJuYW5jZSIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzQzOTQ4NzkzfQ.ITgFywL_aIusiXJCbtnzpao4Mt1qz_-h4o1Z_aqxxS4'
 };
 
-const bianca = { id: '1d74b61b883', name: 'bianca',
+const bianca = { id: '830c2c', name: 'bianca',
 token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgzMGMyYyIsIm5hbWUiOiJ0ZXN0MiIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzQ1MzMyNTQ1fQ.v5PXhRCocKCRWmZav3IO72qcouAsuTe4qjrXlsbGAbw'
 };
 
