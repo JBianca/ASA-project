@@ -1,19 +1,18 @@
 import { DeliverooApi, ioClientSocket, sleep } from "@unitn-asa/deliveroo-js-client";
-import config from "../config.js";
 import AStarDaemon from "./astar_daemon.js";
 import { distance, pickOldestSector, markSector, SECTOR_SIZE } from './utils.js';
 import selectOptimalBatch from "./select_batch.js";
 import { default as argsParser } from "args-parser";
 
 const args = argsParser(process.argv);
-const teamMateId = args['teamId'];
+const host = args.host;
+const token = args.token;
+const teamMateId= args.teamId;
+
 var currentIntention = null;
 var pickupCoordination = {};
 
-const client = new DeliverooApi(
-  config.host,
-  config.token
-);
+const client = new DeliverooApi(host, token);
 
 let PENALTY;
 let DECAY_INTERVAL_MS;
@@ -28,7 +27,7 @@ const suspendedDeliveries = new Set();
 
 client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
-  DECAY_INTERVAL_MS = parseInt(cfg.PARCEL_DECADING_INTERVAL) * 1000;
+  DECAY_INTERVAL_MS = parseInt(cfg.PARCEL_DECAYING_INTERVAL) * 1000;
 });
 
 const me = {id: null, name: null, x: null, y: null, score: null};
@@ -45,16 +44,45 @@ client.onYou(({id, name, x, y, score}) => {
 // add function to exchange message between teammate
 client.onMsg(async (id, name, msg, reply) => {
   //console.log(`Received message from ${name}:`, msg);
+
+  if (msg.action === 'parcel_snapshot') {
+    const now = Date.now();
+    for (const p of msg.parcels) {
+      const existing = parcels.get(p.id) || { ...p };
+      const rivals = [...agents.values()]
+      .filter(a => a.id !== me.id);
+      const contested = rivals.some(a =>
+      distance(a, p) <= distance(me, p)
+      );
+
+      parcels.set(p.id, {
+        ...existing,
+        ...p,    // update x,y,reward,carriedBy
+        spawnTime: existing.spawnTime ?? now,
+        initialReward: existing.initialReward ?? p.reward,
+        lastSeen: existing.lastSeen ?? p.lastSeen ?? now,
+        expectedUtility: contested
+          ? p.reward * (1 - CONTEST_PENALTY)
+          : p.reward,
+        seenBy: {
+          ...(existing.seenBy || {}),
+          [id]: now    // mark “seen by teammate”
+        }
+      });
+    }
+    return;
+  }
+
   if (msg?.action === 'pickup') {
     await sleep(Math.random() * 50); // Random delay to avoid race conditions
     if (reply) {
       try {
-        if (pickupCoordination[msg.parcelId] === me.id) {
+        if (pickupCoordination[msg.parcelId]?.id === me.id) {
           console.log("Replying NO: I'm already picking up parcel", msg.parcelId);
           reply(false);
-        } else if (pickupCoordination[msg.parcelId] === id || !pickupCoordination[msg.parcelId]) {
+        } else if (pickupCoordination[msg.parcelId]?.id === id || !pickupCoordination[msg.parcelId]) {
           console.log("Replying YES: Teammate can pick up parcel", msg.parcelId);
-          pickupCoordination[msg.parcelId] = id;
+          pickupCoordination[msg.parcelId] = { id: id, ts: Date.now() };
           reply(true);
         }
       } catch (error) {
@@ -66,7 +94,7 @@ client.onMsg(async (id, name, msg, reply) => {
 
 const parcels = new Map();
 client.onParcelsSensing(async (pp) => {
-  const now     = Date.now();
+  const now = Date.now();
   const seenIds = new Set(pp.map(p => p.id));
 
   // 1) Update or insert every parcel you currently see
@@ -96,12 +124,18 @@ client.onParcelsSensing(async (pp) => {
 
     parcels.set(p.id, {
       ...p,
-      lastSeen:      now,
+      lastSeen: now,
       spawnTime,
       initialReward,
-      expectedUtility
+      expectedUtility,
+      seenBy: { [me.id]: now }
     });
   }
+
+  await client.emitSay(teamMateId, {
+    action: 'parcel_snapshot',
+    parcels: pp
+  });
 
   // 2) Now expire truly gone parcels:
   for (const [id, p] of parcels) {
@@ -140,38 +174,6 @@ client.onParcelsSensing(async (pp) => {
       // it was delivered, stolen, or decayed away
       suspendedDeliveries.delete(id);
       // console.log('[unsuspend]', id);
-    }
-  }
-
-  // 4) Try to coordinate pickup ---
-  if (pp.length > 0 && !currentIntention) {
-    // Select best available unassigned parcel (by utility)
-    const candidates = pp.filter(p => !pickupCoordination[p.id]);
-    if (candidates.length === 0) return;
-
-    // sort by expectedUtility
-    candidates.sort((a, b) => {
-      const utilA = parcels.get(a.id)?.expectedUtility || 0;
-      const utilB = parcels.get(b.id)?.expectedUtility || 0;
-      return utilB - utilA;
-    });
-
-    const parcel = candidates[0];
-    console.log('[coordination] Trying for parcel', parcel.id);
-
-    const reply = await client.emitAsk(teamMateId, {
-      action: 'pickup',
-      parcelId: parcel.id
-    });
-
-    if (reply) {
-      // I'm authorized
-      if (!pickupCoordination[parcel.id]) {
-        pickupCoordination[parcel.id] = client.id;
-        console.log(`[coordination] I'm assigned to pick up parcel ${parcel.id}`);
-      }
-    } else {
-      console.log(`[coordination] Teammate ${teamMateId} will pick up parcel ${parcel.id}`);
     }
   }
 });
@@ -272,6 +274,83 @@ client.onAgentsSensing(sensedAgents => {
 
 const aStarDaemon = new AStarDaemon(mapTiles);
 
+function estimateCost(start, parcel) {
+  const pathToParcel = aStarDaemon
+    .aStar(start, parcel, n => distance(n, parcel)) || [];
+  const d1 = pathToParcel.length;
+
+  const bestZoneDist = Math.min(
+    ...deliveryZones.map(z =>
+      (aStarDaemon.aStar(parcel, z, n => distance(n, z)) || []).length
+    )
+  );
+
+  const loadFactor = 1
+    + [...parcels.values()].filter(p => p.carriedBy === me.id).length;
+
+  return (d1 + bestZoneDist) * loadFactor;
+}
+
+const PARCEL_TTL = 30_000;     // how long we keep “shared” drops
+
+function assignParcelsToMe() {
+  const assigned = new Set();
+  const mate = agents.get(teamMateId);
+
+  // 0) prune any old private‐claim entries
+  const CLAIM_TTL = 10_000;
+  for (const [pid, claim] of Object.entries(pickupCoordination)) {
+    if (Date.now() - (claim.ts||0) > CLAIM_TTL) {
+      delete pickupCoordination[pid];
+    }
+  }
+
+  const now = Date.now();
+
+  for (const [id, p] of parcels) {
+    // 1) drop parcels neither of us has refreshed recently
+    const lastSeenAny = Math.max(
+      ...Object.values(p.seenBy || {}).map(ts => ts || 0),
+      0
+    );
+    if (now - lastSeenAny > PARCEL_TTL) {
+      parcels.delete(id);
+      continue;
+    }
+
+    // 2) skip if someone else is already carrying it
+    if (p.carriedBy && p.carriedBy !== me.id) continue;
+
+    // 3) compute net utilities
+    const myCost = estimateCost({ x: me.x,      y: me.y }, p);
+    const theirCost = mate
+      ? estimateCost({ x: mate.x,    y: mate.y }, p)
+      : Infinity;
+
+    const myNet = p.expectedUtility - PENALTY * ( myCost    / (DECAY_INTERVAL_MS/1000) );
+    const theirNet = p.expectedUtility - PENALTY * ( theirCost / (DECAY_INTERVAL_MS/1000) );
+
+    if (myNet > theirNet) {
+      assigned.add(id);
+    }
+    else if (Math.abs(myNet - theirNet) < 1e-6) {
+      // a) private‐claim wins
+      if (pickupCoordination[id]?.id === me.id) {
+        assigned.add(id);
+      }
+      // b) otherwise, whoever saw it first wins
+      else if (
+        (p.seenBy[me.id] || 0) >
+        (p.seenBy[teamMateId] || 0)
+      ) {
+        assigned.add(id);
+      }
+    }
+  }
+
+  return assigned;
+}
+
 function optionsGeneration() {
   // if the *current* intention is BulkCollect, do nothing (don't replan!)
   // console.log('[opts] all parcels:', [...parcels.keys()]);
@@ -283,10 +362,16 @@ function optionsGeneration() {
   }
 
   const options   = [];
+  const assignedToMe = assignParcelsToMe();
+
   const carried = [...parcels.values()]
     .find(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id));
   const available = [...parcels.values()]
-    .filter(p => !p.carriedBy && !suspendedDeliveries.has(p.id));
+    .filter(p =>
+      assignedToMe.has(p.id) &&
+      !p.carriedBy &&
+      !suspendedDeliveries.has(p.id)
+    );
   // console.log('[opts] actually available →', available.map(p=>p.id));
   for (const p of parcels.values()) {
     if (suspendedDeliveries.has(p.id) && typeof p.id !== 'string') {
@@ -550,30 +635,29 @@ class GoPickUp extends Plan {
   async execute(goal, x, y, id) {
     if (this.stopped) throw ['stopped'];
 
-    // Check if the parcel is already assigned
-    if (pickupCoordination[id] && pickupCoordination[id] !== me.id) {
-      this.log(`Parcel ${id} is handled by teammate. Skipping.`);
-      parcels.delete(id);
-      suspendedDeliveries.delete(id);
-      throw ['stopped'];
+    const p = parcels.get(id);
+    const mate = agents.get(teamMateId);
+    const myCost = estimateCost(me, p);
+    const theirCost = mate
+      ? estimateCost({x:mate.x, y:mate.y}, p)
+      : Infinity;
+    const myNet = p.expectedUtility  - PENALTY * (myCost / (DECAY_INTERVAL_MS/1000));
+    const theirNet = p.expectedUtility  - PENALTY * (theirCost / (DECAY_INTERVAL_MS/1000));
+
+    if (Math.abs(myNet - theirNet) < 1e-6) {
+      const tieReply = await client.emitAsk(teamMateId, {
+        action: 'pickup',
+        parcelId: id
+      });
+
+      if (!tieReply) {
+        // Teammate says “I will take it”
+        pickupCoordination[id] = { id: teamMateId, ts: Date.now() };
+        throw ['stopped'];
+      }
     }
-
-    // Request pickup permission from the teammate
-    const reply = await client.emitAsk(teamMateId, {
-      action: 'pickup',
-      parcelId: id
-    });
-
-    if (!reply) {
-      this.log(`Teammate denied pickup for ${id}. Aborting.`);
-      pickupCoordination[id] = teamMateId; // Assign to teammate
-      parcels.delete(id);
-      suspendedDeliveries.delete(id);
-      throw ['stopped'];
-    }
-
-    // Assign the parcel to self
-    pickupCoordination[id] = me.id;
+    // else: they declined → we take it
+    pickupCoordination[id] = { id: me.id, ts: Date.now() };
 
     // 0) already standing on the target?
     if (me.x === x && me.y === y) {
@@ -583,22 +667,25 @@ class GoPickUp extends Plan {
         this.log(`GoPickUp: no parcel ${id} here → removing`);
         parcels.delete(id);
         suspendedDeliveries.delete(id);
+        delete pickupCoordination[id];
         throw ['stopped'];
       }
       // success!
       parcels.delete(id);
       suspendedDeliveries.delete(id);
+      delete pickupCoordination[id];
       return true;
     }
 
     // 1) otherwise walk to it once
     try {
       this.log(`GoPickUp → moving to parcel ${id} @(${x},${y})`);
-      await this.subIntention(['go_to', x, y]);
+      await this.subIntention(['go_to', x, y, id]);
     } catch {
       this.log(`GoPickUp: parcel ${id} unreachable — removing`);
       parcels.delete(id);
       suspendedDeliveries.delete(id);
+      delete pickupCoordination[id];
       throw ['stopped'];
     }
 
@@ -609,12 +696,14 @@ class GoPickUp extends Plan {
       this.log(`GoPickUp: pickup failed for ${id} — removing`);
       parcels.delete(id);
       suspendedDeliveries.delete(id);
+      delete pickupCoordination[id];
       throw ['stopped'];
     }
 
     // 3) success!
     parcels.delete(id);
     suspendedDeliveries.delete(id);
+    delete pickupCoordination[id];
     return true;
   }
 }
@@ -742,11 +831,11 @@ class Patrolling extends Plan {
 }
 
 class AstarMove extends Plan {
-  static isApplicableTo(goal, x, y) {
+  static isApplicableTo(goal, x, y, id) {
     return goal === 'go_to';
   }
 
-  async execute(goal, targetX, targetY) {
+  async execute(goal, targetX, targetY, parcelId) {
     const MAX_RETRIES = 4;              // Max times to replan the full path
     const Max_LOCK_WAIT = 4;            // Max num of short waits if a tile is locked
     const STEP_CONFIRM_TIMEOUT = 4;     // Max attempts to confirm that the agent moved
@@ -776,6 +865,11 @@ class AstarMove extends Plan {
 
       for (const step of plan) {
         if (this.stopped) throw ['stopped'];
+        const p = parcels.get(parcelId);
+        if (parcelId && p?.carriedBy && p.carriedBy !== me.id) {
+          delete pickupCoordination[parcelId];
+          throw ['stolen', parcelId];
+        }
 
         const tileKey = `${step.x},${step.y}`;
         const tile = mapTiles.get(tileKey);
@@ -796,13 +890,6 @@ class AstarMove extends Plan {
         try {
           const beforeX = me.x;
           const beforeY = me.y;
-
-          // If coordination assignment was lost, skip this step
-          if (pickupCoordination[id] !== me.id) {
-            this.log('Coordination lost → skipping move, not aborting');
-            await sleep(100); // Let coordination resolve
-            continue;
-          }
 
           // Attempt the move
           const moveResult = await client.emitMove(step.action);
@@ -907,7 +994,7 @@ class BulkCollect extends Plan {
       if (this.stopped) throw ['stopped'];
       this.log(`BulkCollect → heading to pickup ${p.id} @ (${p.x},${p.y})`);
       if (me.x !== p.x || me.y !== p.y) {
-        await this.subIntention(['go_to', p.x, p.y]);
+        await this.subIntention(['go_to', p.x, p.y, p.id]);
       }
       if (this.stopped) throw ['stopped'];
       this.log(`BulkCollect → picking up ${p.id}`);

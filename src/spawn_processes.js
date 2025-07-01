@@ -17,7 +17,7 @@ spawnProcesses( bianca, nance );
 function spawnProcesses( me, teamMate ) {
     
     const childProcess = spawn(
-        `node 7pickup \
+        `node multi_agent \
         host="http://localhost:8080" \
         token="${me.token}" \
         teamId="${teamMate.id}" `,
