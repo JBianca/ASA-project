@@ -108,3 +108,76 @@ export function combinations(array, k) {
 
     return oldestKey.split(',').map(Number);
   }
+
+/**
+ * Find corridor segments by per-cell narrowness + clustering.
+ * @param {Map<string,{type:number}>} mapTiles
+ * @returns {Array<{id:string, cells:{x:number,y:number}[], entrances:{x:number,y:number}[]}>}
+ */
+export function detectCorridors(mapTiles) {
+  // 1) helper to test if (x,y) is walkable
+  const isWalk = (x,y) => {
+    const t = mapTiles.get(`${x},${y}`);
+    return t && t.type > 0;   // treat type 1/2/3 as walkable
+  };
+
+  // 2) find all narrow “corridor” cells
+  const narrow = new Set();
+  for (const key of mapTiles.keys()) {
+    const [x,y] = key.split(',').map(Number);
+    if (!isWalk(x,y)) continue;
+
+    // neighbor flags
+    const N = isWalk(x, y-1), S = isWalk(x, y+1);
+    const W = isWalk(x-1, y), E = isWalk(x+1, y);
+
+    // exactly two neighbors, and they’re opposite
+    if ((E && W && !N && !S) || (N && S && !E && !W)) {
+      narrow.add(key);
+    }
+  }
+
+  // 3) cluster them into connected segments
+  const segments = [];
+  const visited  = new Set();
+
+  for (const key of narrow) {
+    if (visited.has(key)) continue;
+
+    // BFS to collect this segment
+    const queue = [key], cells = [];
+    visited.add(key);
+
+    while (queue.length) {
+      const cur = queue.pop();
+      const [cx, cy] = cur.split(',').map(Number);
+      cells.push({ x: cx, y: cy });
+
+      // check 4-way neighbors
+      for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const nb = `${cx+dx},${cy+dy}`;
+        if (narrow.has(nb) && !visited.has(nb)) {
+          visited.add(nb);
+          queue.push(nb);
+        }
+      }
+    }
+
+    // record this segment
+    // the “entrances” are the two cells in `cells` that have only 1 neighbor within the segment
+    const neighCount = (cell) => {
+      return [[1,0],[-1,0],[0,1],[0,-1]]
+        .filter(([dx,dy])=> narrow.has(`${cell.x+dx},${cell.y+dy}`))
+        .length;
+    };
+    const ends = cells.filter(c=> neighCount(c) === 1);
+    const id   = `seg-${cells[0].x},${cells[0].y}-${cells[ends.length-1]?.x},${ends[ends.length-1]?.y}`;
+    segments.push({
+      id,
+      cells,
+      entrances: ends.length === 2 ? ends : [ cells[0], cells[cells.length-1] ]
+    });
+  }
+
+  return segments;
+}

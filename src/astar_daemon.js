@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// PRIORITY QUEUE (MIN‑HEAP) FOR A*
+// PRIORITY QUEUE (MIN-HEAP) FOR A*
 // ─────────────────────────────────────────────────────────────────────────────
 class PriorityQueue {
   constructor() { this.heap = []; }
@@ -51,9 +51,6 @@ class PriorityQueue {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// A* DAEMON
-// ─────────────────────────────────────────────────────────────────────────────
 const key = node => `${node.x},${node.y}`;
 
 function reconstruct_path(cameFrom, current) {
@@ -68,16 +65,29 @@ function reconstruct_path(cameFrom, current) {
 class AStarDaemon {
   constructor(mapTiles) {
     this.map = mapTiles;
+    // Map from "x,y" → extra cost to add when stepping onto that tile
+    this.tempPenalties = new Map();
   }
+
+  /**
+   * Bump the cost of tile (x,y) by `penalty` for future searches.
+   */
+  addTempPenalty(x, y, penalty) {
+    const k = `${x},${y}`;
+    this.tempPenalties.set(k, (this.tempPenalties.get(k) || 0) + penalty);
+  }
+
   /**
    * @param {{x,y}} start 
    * @param {{x,y}} goal 
-   * @param {fn({x,y}):number} h 
+   * @param {fn({x,y}):number} h  heuristic function
    * @returns {Array<{x,y,action}>|string}
    */
   aStar(start, goal, h) {
-    // quick OOB check
-    if (!this.map.has(key(start)) || !this.map.has(key(goal))) return "failure";
+    // Quick bounds check
+    if (!this.map.has(key(start)) || !this.map.has(key(goal))) {
+      return "failure";
+    }
 
     const openSet = new PriorityQueue();
     const cameFrom = new Map();
@@ -90,15 +100,15 @@ class AStarDaemon {
 
     while (!openSet.isEmpty()) {
       const current = openSet.extractMin();
+
+      // If we've reached the goal (h(current) === 0), reconstruct path
       if (h(current) === 0) {
-        // reached goal
         const nodePath = reconstruct_path(cameFrom, current);
-        // annotate actions
         const withActions = [];
         for (let i = 1; i < nodePath.length; i++) {
           const prev = nodePath[i - 1], nxt = nodePath[i];
           let action = null;
-          if (nxt.x > prev.x) action = 'right';
+          if (nxt.x > prev.x)      action = 'right';
           else if (nxt.x < prev.x) action = 'left';
           else if (nxt.y > prev.y) action = 'up';
           else if (nxt.y < prev.y) action = 'down';
@@ -108,34 +118,37 @@ class AStarDaemon {
       }
 
       const [cx, cy] = [current.x, current.y];
-      // four neighbors
       const neighbors = [
-        { x: cx + 1, y: cy, action: 'right' },
-        { x: cx - 1, y: cy, action: 'left'  },
-        { x: cx, y: cy + 1, action: 'up'    },
-        { x: cx, y: cy - 1, action: 'down'  },
+        { x: cx + 1, y: cy,   action: 'right' },
+        { x: cx - 1, y: cy,   action: 'left'  },
+        { x: cx,     y: cy + 1, action: 'up'    },
+        { x: cx,     y: cy - 1, action: 'down'  },
       ];
 
       for (const nb of neighbors) {
-        const k    = key(nb);
+        const k = key(nb);
         const tile = this.map.get(k);
-      
-        // skip OOB, walls, or occupied tiles
-        if (!tile || tile.type === 0 || tile.locked) {
+
+        // Skip out-of-bounds, walls, or occupied tiles
+        if (!tile || tile.type === 0 || tile.locked || tile.corridorLocked) {
           continue;
         }
-      
-        const tentative_g = (gScore.get(key(current)) ?? Infinity) + 1;
-        if (tentative_g < (gScore.get(k) ?? Infinity)) {
+
+        // Base movement cost (1) plus any temporary penalty
+        const extra  = this.tempPenalties.get(k) || 0;
+        const tentativeG = (gScore.get(key(current)) ?? Infinity) + 1 + extra;
+
+        if (tentativeG < (gScore.get(k) ?? Infinity)) {
           cameFrom.set(k, current);
-          gScore.set(k, tentative_g);
-          const f = tentative_g + h(nb);
+          gScore.set(k, tentativeG);
+          const f = tentativeG + h(nb);
           fScore.set(k, f);
           openSet.insert({ x: nb.x, y: nb.y }, f);
         }
       }
     }
 
+    // No path found
     return "failure";
   }
 }

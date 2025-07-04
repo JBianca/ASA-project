@@ -37,3 +37,5 @@ function spawnProcesses( me, teamMate ) {
     });
 
 };
+
+// DEBUG=socket.io-client* for debugging messages

@@ -1,6 +1,6 @@
 import { DeliverooApi, ioClientSocket, sleep } from "@unitn-asa/deliveroo-js-client";
 import AStarDaemon from "./astar_daemon.js";
-import { distance, pickOldestSector, markSector, SECTOR_SIZE } from './utils.js';
+import { distance, pickOldestSector, markSector, SECTOR_SIZE, detectCorridors } from './utils.js';
 import selectOptimalBatch from "./select_batch.js";
 import { default as argsParser } from "args-parser";
 
@@ -23,6 +23,13 @@ const MAX_TILES_PER_SECTOR = 10;
 const SCOUT_STEPS = 5;            // scouting steps around parcel-spawning tiles
 
 const suspendedDeliveries = new Set();
+
+const CORRIDOR_LOCK_TTL = 500;
+let corridorCellMap  = new Map();
+const corridorCellsById = new Map();
+const pendingCorridorPromises = new Map();
+let corridorSegments = [];
+const corridorLocks = {};
 
 client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
@@ -100,6 +107,86 @@ client.onMsg(async (id, name, msg, reply) => {
       } catch (error) {
         console.error(error);
       }
+    }
+  }
+
+  switch (msg.action) {
+
+    // 1) SHOUT: everyone (including you) hears “this corridor is now owned by X”
+    case 'corridor': {
+      const { corridorId, owner: locker, ts } = msg;
+      console.log(
+        `[${me.name}] ← SHOUT corridor ${corridorId} now owned by ${locker} @ ${new Date(ts).toISOString()}`
+      );
+
+      // update who holds the lock
+      if (!corridorLocks[corridorId] || ts >= corridorLocks[corridorId].ts) {
+        corridorLocks[corridorId] = { owner: locker, ts };
+        const cells = corridorCellsById.get(corridorId) || [];
+        for (const key of cells) {
+          mapTiles.get(key).corridorLocked = (locker !== me.id);
+        }
+      }
+      return;
+    }
+
+    // 2) REQUEST: someone asks *you* to grant access → decide & reply,
+    //    but don’t touch mapTiles here
+    case 'corridor_request': {
+      const { corridorId, owner: requester, ts } = msg;
+      if (requester === me.id) return;
+      console.log(
+        `[${me.name}] ← REQUEST corridor ${corridorId} from ${requester} @ ${new Date(ts).toISOString()}`
+      );
+      const current = corridorLocks[corridorId];
+      const willGrant = !current || current.owner === requester || ts < current.ts;
+      console.log(`[${me.name}] → willGrant=${willGrant} (current owner=${current?.owner||'none'})`);
+
+      if (willGrant) {
+        corridorLocks[corridorId] = { owner: requester, ts };
+      }
+      client.emitSay(id, {
+        action: 'corridor_response',
+        corridorId,
+        granted: willGrant
+      });
+      return;
+    }
+
+    // 3) RESPONSE: the reply to *your* request → just resolve the promise
+    //    (the shout that you immediately emit next will run the SHOUT handler)
+    case 'corridor_response': {
+      const { corridorId, granted } = msg;
+      console.log(`[${me.name}] ← RESPONSE corridor ${corridorId}: granted=${granted}`);
+      const resolve = pendingCorridorPromises.get(corridorId);
+      if (resolve) {
+        resolve(granted);
+        pendingCorridorPromises.delete(corridorId);
+      }
+
+      // if denied, mark it locked locally so you stop asking
+      if (!granted) {
+        corridorLocks[corridorId] = { owner: 'other', ts: Date.now() };
+        const cells = corridorCellsById.get(corridorId) || [];
+        for (const key of cells) {
+          mapTiles.get(key).corridorLocked = true;
+        }
+      }
+      return;
+    }
+
+    // 4) RELEASE: someone frees it → clear both your table and the tiles
+    case 'corridor_release': {
+    const { corridorId, ts } = msg;
+    // only clear if the release matches the lock we think we hold
+    if (corridorLocks[corridorId]?.ts === ts) {
+      delete corridorLocks[corridorId];
+      const cells = corridorCellsById.get(corridorId) || [];
+      for (const key of cells) {
+        mapTiles.get(key).corridorLocked = false;
+      }
+    }
+      return;
     }
   }
 });
@@ -225,7 +312,78 @@ client.onMap((width, height, tiles) => {
       { type: t.type, locked: false }
     );
   }
+  buildCorridorMap(width, height, tiles);
 });
+
+function buildCorridorMap(width, height, tiles) {
+  // console.log(`[${me.name}] 🔄 got onMap, building corridor map…`);
+
+  deliveryZones.length = 0;
+  for (const tile of tiles) {
+    if (tile.type === 2) deliveryZones.push({ x: tile.x, y: tile.y });
+  }
+
+  mapTiles.clear();
+  for (const t of tiles) {
+    mapTiles.set(
+      `${t.x},${t.y}`,
+      { type: t.type, locked: false, corridorLocked: false }
+    );
+  }
+
+  corridorSegments = detectCorridors(mapTiles);
+  corridorCellMap.clear();
+  corridorCellsById.clear();
+
+  for (const [cid, {owner, ts}] of Object.entries(corridorLocks)) {
+    const cells = corridorCellsById.get(cid) || [];
+    for (const key of cells) {
+      mapTiles.get(key).corridorLocked = true;
+    }
+  }
+
+  for (const seg of corridorSegments) {
+    const keys = seg.cells.map(c => `${c.x},${c.y}`);
+    corridorCellsById.set(seg.id, keys);
+    for (const key of keys) corridorCellMap.set(key, seg.id);
+  }
+
+  console.log('[DEBUG] detected corridors:', corridorSegments.map(s => ({
+    id: s.id, span: s.cells.length+' cells', exampleCell: `${s.cells[0].x},${s.cells[0].y}`
+  })));
+}
+
+function getCorridorId(x,y) {
+  const key = `${x},${y}`;
+  const cid = corridorCellMap.get(key) || null;
+  //console.log(`[${me.name}] getCorridorId(${key}) →`, cid);
+  return cid;
+}
+
+async function askCorridorLock(toId, corridorId, owner) {
+  return new Promise(resolve => {
+    pendingCorridorPromises.set(corridorId, resolve);
+    client.emitSay(toId, {
+      action: 'corridor_request',
+      corridorId,
+      owner,
+      ts: Date.now()
+    });
+    // optionally: add a timeout here to auto‐reject if no answer
+  });
+}
+
+async function acquireCorridor(cid) {
+  const granted = await askCorridorLock(teamMateId, cid, me.id);
+  if (!granted) throw new Error(`corridor ${cid} denied`);
+  // broadcast to everyone that you now hold it
+  client.emitSay(teamMateId, {
+    action: 'corridor',
+    corridorId: cid,
+    owner: me.id,
+    ts: Date.now()
+  });
+}
 
 // When a single tile updates:
 client.onTile(tile => {
@@ -818,12 +976,28 @@ class Patrolling extends Plan {
   }
 }
 
+function cleanupCorridorLocks() {
+  const now = Date.now();
+  const TTL =  3000;
+  for (const [cid, { ts }] of Object.entries(corridorLocks)) {
+    if (now - ts > TTL) {
+      delete corridorLocks[cid];
+      const cells = corridorCellsById.get(cid) || [];
+      for (const key of cells) {
+        mapTiles.get(key).corridorLocked = false;
+      }
+    }
+  }
+}
+
 class AstarMove extends Plan {
   static isApplicableTo(goal, x, y, id) {
     return goal === 'go_to';
   }
 
   async execute(goal, targetX, targetY, parcelId) {
+    cleanupCorridorLocks();
+
     const MAX_RETRIES = 4;              // Max times to replan the full path
     const MAX_LOCK_WAIT = 4;            // Max num of short waits if a tile is locked
     const STEP_CONFIRM_TIMEOUT = 4;     // Max attempts to confirm that the agent moved
@@ -840,7 +1014,7 @@ class AstarMove extends Plan {
         n => {
           const tile = mapTiles.get(`${n.x},${n.y}`);
           // Heuristic: Manhattan distance + penalty if tile is currently locked
-          return Math.abs(n.x - targetX) + Math.abs(n.y - targetY) + (tile?.locked ? 15 : 0);
+          return Math.abs(n.x - targetX) + Math.abs(n.y - targetY) + (tile?.locked || tile?.corridorLocked ? 15 : 0);
         }
       );
 
@@ -851,8 +1025,54 @@ class AstarMove extends Plan {
         continue;
       }
 
+      let prevCorridor = null;
       for (const step of plan) {
         if (this.stopped) throw ['stopped'];
+
+        // —— corridor lock logic begins ——
+        const cid = getCorridorId(step.x, step.y);
+        if (cid && cid !== prevCorridor) {
+          // request new corridor
+          const granted = await askCorridorLock(teamMateId, cid, me.id);
+          if (!granted) {
+            throw new Error(`Corridor ${cid} denied`);
+          }
+
+          // **immediately update your own local state** so you see it unlocked
+          const ts = Date.now();
+          corridorLocks[cid] = { owner: me.id, ts };
+          const cells = corridorCellsById.get(cid) || [];
+          console.log("CLEARED locally:", cid, cells);
+          for (const key of cells) {
+            mapTiles.get(key).corridorLocked = false;
+          }
+
+          // then broadcast the shout so others lock it
+          client.emitSay(teamMateId, {
+            action: 'corridor',
+            corridorId: cid,
+            owner: me.id,
+            ts
+          });
+
+          // release previous corridor REMOTELY…
+          if (prevCorridor) {
+            client.emitSay(teamMateId, {
+              action: 'corridor_release',
+              corridorId: prevCorridor
+            });
+            // …and also clear it LOCALLY
+            delete corridorLocks[prevCorridor];
+            const oldCells = corridorCellsById.get(prevCorridor) || [];
+            for (const key of oldCells) {
+              mapTiles.get(key).corridorLocked = false;
+            }
+          }
+
+          prevCorridor = cid;
+        }
+        // —— corridor lock logic ends ——
+
         const p = parcels.get(parcelId);
         if (parcelId && p?.carriedBy && p.carriedBy !== me.id) {
           delete pickupCoordination[parcelId];
@@ -864,12 +1084,12 @@ class AstarMove extends Plan {
 
         // Wait a few cycles if the tile is locked
         let lockWaits = 0;
-        while (tile?.locked && lockWaits++ < MAX_LOCK_WAIT) {
+        while ((tile?.locked || tile?.corridorLocked) && lockWaits++ < MAX_LOCK_WAIT) {
           await sleep(30 + Math.random() * 50);
         }
 
         // If still locked, penalize tile and continue with the rest of the plan
-        if (tile?.locked) {
+        if (tile?.locked || tile?.corridorLocked) {
           aStarDaemon.addTempPenalty(step.x, step.y, 10);   //TODO: implement this!
           await sleep(30 + Math.random() * 50);
           continue;
@@ -913,6 +1133,12 @@ class AstarMove extends Plan {
 
           // Exit early if target reached
           if (currentX === targetX && currentY === targetY) {
+            if (prevCorridor) {
+              client.emitSay(teamMateId, {
+                action: 'corridor_release',
+                corridorId: prevCorridor
+              });
+          }
             return true;
           }
 
