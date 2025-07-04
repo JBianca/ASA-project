@@ -373,6 +373,7 @@ function assignParcelsToMe() {
 }
 
 function optionsGeneration() {
+  // console.trace(`[${me.name}] optionsGeneration()`);
   // if the *current* intention is BulkCollect, do nothing (don't replan!)
   // console.log('[opts] all parcels:', [...parcels.keys()]);
   // console.log('[opts] suspended:', Array.from(suspendedDeliveries));
@@ -504,8 +505,7 @@ class Intention {
       if (this.#parent?.log)
           this.#parent.log('\t', ...args);
       else
-          void 0
-          // console.log(...args);
+          console.log(...args);
   }
 
   async achieve() {
@@ -526,91 +526,59 @@ class Intention {
 }
 
 class IntentionRevision {
-    _intention_queue = [];
-    get intention_queue() {
-        return this._intention_queue;
-    }
+  #intention_queue = [];
+  get intention_queue() { return this.#intention_queue; }
 
-    async loop() {
-        while (true) {
-            if (this.intention_queue.length > 0) {
-                const intention = this.intention_queue[0];
-                let id = intention.predicate[3];
-                let p = parcels.get(id);
-                if (p && p.carriedBy) {
-                    continue;
-                }
-                await intention.achieve().catch(() => {});
-                this.intention_queue.shift();
-            } else {
-              // queue empty → pick a new intention immediately
-              optionsGeneration();
-            }
-            await new Promise(res => setImmediate(res));
+  async loop() {
+    let lastActionTime = Date.now();
+    const STUCK_THRESHOLD = 3000; // ms
+
+    while (true) {
+      if (this.intention_queue.length > 0) {
+        const intention = this.intention_queue[0];
+        let id = intention.predicate[3] || intention.predicate[2];
+        let p = parcels.get(id);
+        if (p && p.carriedBy && intention.predicate[0] !== "handoff_pickup") {
+          // Skip this intention if not valid anymore
+          this.intention_queue.shift();
+          continue;
         }
+        try {
+          await intention.achieve();
+        } catch {}
+        this.intention_queue.shift();
+        lastActionTime = Date.now();
+      } else {
+        // No intention? Trigger planning
+        await optionsGeneration();
+        lastActionTime = Date.now();
+      }
+
+      // Stuck recovery
+      if (Date.now() - lastActionTime > STUCK_THRESHOLD) {
+        console.log("Force resetting intentions due to inactivity");
+        this.#intention_queue = [];
+        await optionsGeneration();
+        lastActionTime = Date.now();
+      }
+
+      await new Promise(res => setImmediate(res));
     }
+  }
 
-    log(...args) {
-        // console.log(...args);
-    }
-}
-
-class IntentionRevisionReplace extends IntentionRevision {
-  // Keep track when the last intention was added
-  #lastPushTime = 0;
-
-  // Do not add new intention more than once in - second
-  COOLDOWN_MS = 1000; // 1 second cooldown
-
-   /**
-   * Add a new goal  to the list.
-   * If it's the same as the last one, or if it's too soon, do nothing.
-   */
+  // Regular push: avoid queueing the same intention
   async push(predicate) {
-    // Less than 1 second since the last push, skip it
-    if (Date.now() - this.#lastPushTime < this.COOLDOWN_MS) return;
-
-    // Update the last push time to now
-    this.#lastPushTime = Date.now();
-
-    // Get the most recent intention from the list
     const last = this.intention_queue.at(-1);
-
-    // If the new goal is exactly the same as the last one, skip it
     if (last && last.predicate.join(' ') == predicate.join(' ')) return;
-
-    // Create and push a new intention
     const intention = new Intention(this, predicate);
     this.intention_queue.push(intention);
 
     // If there was a previous intention, stop it so we only follow one at a time
     if (last) last.stop();
   }
-
-  
-  // If the agent hasn't done anything for too long, it resets intentions to recover
-  async loop() {
-    const STUCK_THRESHOLD = 3000; // 3 seconds of inactivity before reset
-    let lastActionTime = Date.now();
-
-    while (true) {
-      // If too much time has passed without any change, assume we're stuck and clear intentions
-      if (Date.now() - lastActionTime > STUCK_THRESHOLD) {
-        console.log('Force resetting intentions due to inactivity');
-        this._intention_queue = [];
-        optionsGeneration(); // regenerate available options
-      }
-
-      // Reset the timer 
-      lastActionTime = Date.now();
-
-      // Allow the rest of the program to run
-      await new Promise(res => setImmediate(res));
-    }
-  }
 }
 
-const myAgent = new IntentionRevisionReplace();
+const myAgent = new IntentionRevision();
 myAgent.loop();
 
 const planLibrary = [];
@@ -637,8 +605,7 @@ class Plan {
         if (this.#parent?.log)
             this.#parent.log('\t', ...args);
         else
-            void O
-            // console.log(...args);
+            console.log(...args);
     }
 
     async subIntention(predicate) {
@@ -780,7 +747,7 @@ class Patrolling extends Plan {
 
     // Try a handful of different sectors
     for (let sTry = 1; sTry <= MAX_SECTORS_TO_TRY; sTry++) {
-      const [sx, sy] = pickOldestSector();
+      const [sx, sy] = pickOldestSector(mapTiles);
       markSector(me.x, me.y);    // mark *current* sector so we age others
       markSector(sx * SECTOR_SIZE, sy * SECTOR_SIZE); // also mark chosen sector
 

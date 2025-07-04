@@ -1,5 +1,3 @@
-import { mapTiles } from './agent.js';
-
 export const SECTOR_SIZE = 5;
 export const sectorLastVisit = new Map(); // "sx,sy" → timestamp
 
@@ -84,7 +82,7 @@ export function combinations(array, k) {
     sectorLastVisit.set(`${sx},${sy}`, Date.now());
   }
   
-  export function pickOldestSector() {
+  export function pickOldestSector(mapTiles) {
     // 1) Scan every walkable tile and ensure its sector has an entry
     const tile1Sectors = new Set();
     for (const key of mapTiles.keys()) {
