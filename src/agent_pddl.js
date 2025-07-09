@@ -1,19 +1,27 @@
-import { DeliverooApi } from "@unitn-asa/deliveroo-js-client";
+import { DeliverooApi, ioClientSocket } from "@unitn-asa/deliveroo-js-client";
+import config from "../config.js";
+import AStarDaemon from "./astar_daemon.js";
+import { distance, pickOldestSector, markSector, SECTOR_SIZE } from './utils.js';
+import selectOptimalBatch from "./select_batch.js";
 import { planner, goalParser, mapParser, readDomain } from "./pddl_planner.js"; // Add PDDL imports
-import { distance } from './utils.js';
 
 // Initialize PDDL Domain
 readDomain().then(() => console.log("Domain loaded")).catch(console.error);
 
 const client = new DeliverooApi(
-  "http://localhost:8080/",
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImNjMmUxOSIsIm5hbWUiOiJhIiwidGVhbUlkIjoiMjgwMmYzIiwidGVhbU5hbWUiOiJkaXNpIiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NDI5ODA3NTh9.q9cmPHitmC5oiVHbk5VUJPuA2B89sLC6DYIWDheB7cM"
+  config.host,
+  config.token
 );
 
 let PENALTY;
 let DECAY_INTERVAL_MS;
 
-const MAX_TRIES = 3;
+const CONTEST_RADIUS = 3;         // Manhattan distance threshold
+const CONTEST_PENALTY = 0.5;      // 50% discount on contested parcels
+const MAX_SECTORS_TO_TRY = 5;
+const MAX_TILES_PER_SECTOR = 10;
+const SCOUT_STEPS = 5;            // scouting steps around parcel-spawning tiles
+
 const suspendedDeliveries = new Set();
 
 client.onConfig(cfg => {
@@ -32,7 +40,6 @@ client.onYou(({id, name, x, y, score}) => {
 });
 
 const parcels = new Map();
-
 client.onParcelsSensing(pp => {
   const now     = Date.now();
   const seenIds = new Set(pp.map(p => p.id));
@@ -47,6 +54,17 @@ client.onParcelsSensing(pp => {
       continue;
     }
 
+    // anybody else strictly closer (or tie) to this parcel?
+    const rivals = [...agents.values()]
+      .filter(a => a.id !== me.id);
+    const contested = rivals.some(a =>
+      distance(a, p) <= distance(me, p)
+    );
+
+    const expectedUtility = contested
+      ? p.reward * (1 - CONTEST_PENALTY)
+      : p.reward;
+
     // Otherwise upsert with stamps
     const spawnTime     = old ? old.spawnTime     : now;
     const initialReward = old ? old.initialReward : p.reward;
@@ -55,7 +73,8 @@ client.onParcelsSensing(pp => {
       ...p,
       lastSeen:      now,
       spawnTime,
-      initialReward
+      initialReward,
+      expectedUtility
     });
   }
 
@@ -90,14 +109,11 @@ client.onParcelsSensing(pp => {
     }
   }
 
-  // 3) Finally, if any suspended deliveries are no longer carriedBy you at all,
-  //    un-suspend them (they must’ve been dropped elsewhere).
-  const stillCarried = new Set(
-    pp.filter(p => p.carriedBy === me.id).map(p => p.id)
-  );
-  for (const id of suspendedDeliveries) {
-    if (!stillCarried.has(id)) {
+  for (const id of Array.from(suspendedDeliveries)) {
+    if (!parcels.has(id)) {
+      // it was delivered, stolen, or decayed away
       suspendedDeliveries.delete(id);
+      console.log('[unsuspend]', id);
     }
   }
 });
@@ -126,7 +142,7 @@ client.onTile(tile => {
   }
 });
 
-const mapTiles = new Map();
+export const mapTiles = new Map();
 
 client.onMap((width, height, tiles) => {
   mapTiles.clear();
@@ -150,6 +166,7 @@ client.onMap((width, height, tiles) => {
   });
   mapParser(matrix);
 });
+
 
 // When a single tile updates:
 client.onTile(tile => {
@@ -184,80 +201,177 @@ client.onAgentsSensing(sensedAgents => {
     const tile = mapTiles.get(key);
     if (tile) tile.locked = true;
   }
+
+  // 3) mark every parcel.p.contested = true if some other agent is near it
+  for (const p of parcels.values()) {
+    let contested = false;
+    for (const a of sensedAgents) {
+      if (a.id !== me.id) {
+        const d = Math.abs(a.x - p.x) + Math.abs(a.y - p.y);
+        if (d <= CONTEST_RADIUS) {
+          contested = true;
+          break;
+        }
+      }
+    }
+    p.contested = contested;
+  }
+
+  for (const p of parcels.values()) {
+    if (!p.contested && suspendedDeliveries.has(p.id)) {
+      suspendedDeliveries.delete(p.id);
+      console.log('[unsuspend]', p.id, 'no longer contested');
+    }
+  }
 });
 
+const aStarDaemon = new AStarDaemon(mapTiles);
+
 function optionsGeneration() {
-  const options = [];
+  // if the *current* intention is BulkCollect, do nothing (don't replan!)
+  // console.log('[opts] all parcels:', [...parcels.keys()]);
+  // console.log('[opts] suspended:', Array.from(suspendedDeliveries));
 
-  // Find the parcel currently carried by the agent (if any)
-  const carriedParcel = [...parcels.values()].find(p => p.carriedBy === me.id);
+  const current = myAgent.intention_queue[0];
+  if (current && current.predicate[0] !== 'patrolling') {
+    return;
+  }
 
-  // Get the list of parcels that are available (not being carried)
-  const availableParcels = [...parcels.values()].filter(p => !p.carriedBy);
-
-  // CASE 1: No available parcels to pick up
-  if (availableParcels.length === 0) {
-
-    // If the agent is carrying a parcel and there are delivery zones, plan to deliver
-    if (carriedParcel && deliveryZones.length > 0) {
-      const closestDeliveryZone = deliveryZones.reduce((a, b) =>
-        distance(me, a) < distance(me, b) ? a : b
-      );
-      options.push(['go_deliver', closestDeliveryZone.x, closestDeliveryZone.y]);
-
-    // Otherwise, move randomly to explore the map
-    } else {
-      const directions = ['up', 'down', 'left', 'right'];
-      const dir = directions[Math.floor(Math.random() * directions.length)];
-      const dx = dir === 'left' ? -1 : dir === 'right' ? 1 : 0;
-      const dy = dir === 'up' ? 1 : dir === 'down' ? -1 : 0;
-      options.push(['go_to', me.x + dx, me.y + dy]);
+  const options   = [];
+  const carried = [...parcels.values()]
+    .find(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id));
+  const available = [...parcels.values()]
+    .filter(p => !p.carriedBy && !suspendedDeliveries.has(p.id));
+  // console.log('[opts] actually available →', available.map(p=>p.id));
+  for (const p of parcels.values()) {
+    if (suspendedDeliveries.has(p.id) && typeof p.id !== 'string') {
+      console.warn('[type-mismatch] suspended has', p.id, 'typeof p.id=', typeof p.id);
     }
+  }
 
-  // CASE 2: There are parcels available
-  } else {
-    // Find the closest available parcel
-    const closestParcel = availableParcels.reduce((a, b) =>
+  const LOCAL_RADIUS = 6;
+  const localCount = available.reduce((cnt, p) => {
+    const d = Math.abs(p.x - me.x) + Math.abs(p.y - me.y);
+    return cnt + (d <= LOCAL_RADIUS ? 1 : 0);
+  }, 0);
+
+  // 1) If you're carrying something, go deliver.
+  if (carried && deliveryZones.length) {
+    const dz = deliveryZones.reduce((a, b) =>
       distance(me, a) < distance(me, b) ? a : b
     );
-
-    // Find the closest delivery zone
-    const closestDeliveryZone = deliveryZones.reduce((a, b) =>
-      distance(me, a) < distance(me, b) ? a : b
+    options.push(['go_deliver', dz.x, dz.y]);
+  }
+  else if (available.length > 0) {
+    // 2) Try bulk first…
+    const batchResult = selectOptimalBatch(
+      available,
+      { x: me.x, y: me.y },
+      deliveryZones,
+      aStarDaemon,
+      PENALTY,
+      DECAY_INTERVAL_MS/1000,
+      localCount
     );
-
-    // If the agent is carrying a parcel, decide whether to deliver or pick up another
-    if (carriedParcel && deliveryZones.length > 0) {
-      if (distance(me, closestDeliveryZone) < distance(me, closestParcel)) {
-        options.push(['go_deliver', closestDeliveryZone.x, closestDeliveryZone.y]);
+  
+    if (
+      batchResult &&
+      Array.isArray(batchResult.route) &&
+      batchResult.route.length > 0
+    ) {
+      const { route } = batchResult;
+      if (route.length > 1) {
+        options.push(['bulk_collect', ...route.map(p => p.id)]);
       } else {
-        options.push(['go_pick_up', closestParcel.x, closestParcel.y, closestParcel.id]);
+        const p = route[0];
+        options.push(['go_pick_up', p.x, p.y, p.id]);
       }
-    // If the agent is not carrying anything, go pick up the closest parcel
-    } else {
-      options.push(['go_pick_up', closestParcel.x, closestParcel.y, closestParcel.id]);
+    }
+    else {
+      console.warn('bulk plan failed → falling back to single‐pickup');
+      // 3) Fallback: try each parcel individually (by nearest first)
+      const byDist = available
+        .slice()
+        .sort((a,b)=> distance(me,a) - distance(me,b));
+      let found = false;
+      for (const p of byDist) {
+        const singleRoute = aStarDaemon.aStar(
+           { x: me.x, y: me.y },
+           { x: p.x, y: p.y },
+           n => Math.abs(n.x - p.x) + Math.abs(n.y - p.y)
+        );
+        if (Array.isArray(singleRoute) && singleRoute.length > 0) {
+          options.push(['go_pick_up', p.x, p.y, p.id]);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        console.warn('no single parcel reachable → patrol');
+        options.push(['patrolling']);
+      }
     }
   }
-
-  // Choose the best option (with the minimum distance to execute)
-  let best_option;
-  let nearest = Number.MAX_VALUE;
-  for (const option of options) {
-    let [, x, y] = option;
-    let d = distance({ x, y }, me);
-    if (d < nearest) {
-      best_option = option;
-      nearest = d;
-    }
+  else {
+    // Nothing to do: patrol
+    options.push(['patrolling']);
   }
 
-  // Add the chosen option to the agent's intention queue
-  if (best_option) myAgent.push(best_option);
-}
+  // 4) don’t re‐push the same intention twice
+  const best = options[0];
+  const last = myAgent.intention_queue.at(-1);
+  const same = last?.predicate?.length === best.length
+    && last.predicate.every((v,i)=>String(v)===String(best[i]));
+  if (!same) myAgent.push(best);
+} 
 
 client.onParcelsSensing(optionsGeneration);
 client.onAgentsSensing(optionsGeneration);
 client.onYou(optionsGeneration);
+
+class Intention {
+  #current_plan;
+  #stopped = false;
+  #started = false;
+  #parent;
+  #predicate;
+
+  constructor(parent, predicate) {
+      this.#parent = parent;
+      this.#predicate = predicate;
+  }
+
+  get stopped() { return this.#stopped; }
+  get predicate() { return this.#predicate; }
+
+  stop() {
+      this.#stopped = true;
+      if (this.#current_plan) this.#current_plan.stop();
+  }
+
+  log(...args) {
+      if (this.#parent?.log)
+          this.#parent.log('\t', ...args);
+      else
+          console.log(...args);
+  }
+
+  async achieve() {
+      if (this.#started) return this;
+      this.#started = true;
+      for (const planClass of planLibrary) {
+          if (this.stopped) throw ['stopped intention', ...this.predicate];
+          if (planClass.isApplicableTo(...this.predicate)) {
+              this.#current_plan = new planClass(this.#parent);
+              try {
+                  return await this.#current_plan.execute(...this.predicate);
+              } catch (error) {}
+          }
+      }
+      if (this.stopped) throw ['stopped intention', ...this.predicate];
+      throw ['no plan satisfied the intention', ...this.predicate];
+  }
+}
 
 class IntentionRevision {
     #intention_queue = [];
@@ -276,6 +390,9 @@ class IntentionRevision {
                 }
                 await intention.achieve().catch(() => {});
                 this.intention_queue.shift();
+            } else {
+              // queue empty → pick a new intention immediately
+              optionsGeneration();
             }
             await new Promise(res => setImmediate(res));
         }
@@ -298,50 +415,6 @@ class IntentionRevisionReplace extends IntentionRevision {
 
 const myAgent = new IntentionRevisionReplace();
 myAgent.loop();
-
-class Intention {
-    #current_plan;
-    #stopped = false;
-    #started = false;
-    #parent;
-    #predicate;
-
-    constructor(parent, predicate) {
-        this.#parent = parent;
-        this.#predicate = predicate;
-    }
-
-    get stopped() { return this.#stopped; }
-    get predicate() { return this.#predicate; }
-
-    stop() {
-        this.#stopped = true;
-        if (this.#current_plan) this.#current_plan.stop();
-    }
-
-    log(...args) {
-        if (this.#parent?.log)
-            this.#parent.log('\t', ...args);
-        else
-            console.log(...args);
-    }
-
-    async achieve() {
-        if (this.#started) return this;
-        this.#started = true;
-        for (const planClass of planLibrary) {
-            if (this.stopped) throw ['stopped intention', ...this.predicate];
-            if (planClass.isApplicableTo(...this.predicate)) {
-                this.#current_plan = new planClass(this.#parent);
-                try {
-                    return await this.#current_plan.execute(...this.predicate);
-                } catch (error) {}
-            }
-        }
-        if (this.stopped) throw ['stopped intention', ...this.predicate];
-        throw ['no plan satisfied the intention', ...this.predicate];
-    }
-}
 
 const planLibrary = [];
 
@@ -385,126 +458,49 @@ class GoPickUp extends Plan {
   async execute(goal, x, y, id) {
     if (this.stopped) throw ['stopped'];
 
-    // If we're already standing on the parcel, pick it up right away.
+    // 0) already standing on the target?
     if (me.x === x && me.y === y) {
-      this.log('GoPickUp: already on parcel, picking up');
-      await client.emitPickup();
-      if (this.stopped) throw ['stopped'];
+      this.log(`GoPickUp: already on parcel ${id}, attempting pickup`);
+      const ok = await client.emitPickup();
+      if (!ok) {
+        this.log(`GoPickUp: no parcel ${id} here → removing`);
+        parcels.delete(id);
+        suspendedDeliveries.delete(id);
+        throw ['stopped'];
+      }
+      // success!
+      parcels.delete(id);
+      suspendedDeliveries.delete(id);
       return true;
     }
 
-    await this.subIntention(['go_to', x, y]);
-    if (this.stopped) throw ['stopped'];
+    // 1) otherwise walk to it once
+    try {
+      this.log(`GoPickUp → moving to parcel ${id} @(${x},${y})`);
+      await this.subIntention(['go_to', x, y]);
+    } catch {
+      this.log(`GoPickUp: parcel ${id} unreachable — removing`);
+      parcels.delete(id);
+      suspendedDeliveries.delete(id);
+      throw ['stopped'];
+    }
 
-    await client.emitPickup();
-    if (this.stopped) throw ['stopped'];
+    // 2) try the pickup
+    this.log(`GoPickUp → picking up parcel ${id}`);
+    const ok = await client.emitPickup();
+    if (!ok) {
+      this.log(`GoPickUp: pickup failed for ${id} — removing`);
+      parcels.delete(id);
+      suspendedDeliveries.delete(id);
+      throw ['stopped'];
+    }
 
+    // 3) success!
+    parcels.delete(id);
+    suspendedDeliveries.delete(id);
     return true;
   }
 }
-
-class GoDeliver extends Plan {
-  static isApplicableTo(goal, x, y) {
-    return goal === 'go_deliver';
-  }
-
-  async execute(goal, x, y) {
-    // collect the *active* carried IDs
-    const toDeliver = [...parcels.values()]
-      .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
-      .map(p => p.id);
-
-    if (!toDeliver.length) {
-      this.log('GoDeliver: nothing to deliver (all suspended)');
-      return true;
-    }
-
-    // same “try each delivery‐zone with back-off” you already have…
-    const zones = deliveryZones.slice().sort((a,b)=>distance(me,a)-distance(me,b));
-    for (const dz of zones) {
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          this.log(`GoDeliver → to ${dz.x},${dz.y} [attempt ${attempt}]`);
-          await this.subIntention(['go_to', dz.x, dz.y]);
-          // success!
-          for (const id of toDeliver) suspendedDeliveries.delete(id);
-          await client.emitPutdown();  // drop one by one if you like
-          return true;
-        } catch (_) {
-          this.log(`  GoDeliver: blocked at (${dz.x},${dz.y}) on attempt ${attempt}`);
-        }
-      }
-      this.log(`  GoDeliver: giving up on zone (${dz.x},${dz.y}), trying next`);
-    }
-
-    // if we get here, *all* zones failed → suspend these parcels
-    for (const id of toDeliver) suspendedDeliveries.add(id);
-    this.log('GoDeliver: all zones blocked → suspending delivery of', toDeliver);
-    throw ['stopped'];   // abort so that optionsGeneration will pick something else
-  }
-}
-
-class BlindMove extends Plan {
-    static isApplicableTo(goal, x, y) {
-      return goal === 'go_to';
-    }
-  
-    async execute(goal, x, y) {
-      this.log('BlindMove from', me.x, me.y, 'to', { x, y });
-      // track where we came from, so we don't immediately step back
-      let prevPos = null;
-  
-      // keep going until we reach the exact target
-      outer: while (me.x !== x || me.y !== y) {
-        if (this.stopped) throw ['stopped'];
-  
-        // capture current pos so after a successful move we can set prevPos
-        const curr = { x: me.x, y: me.y };
-  
-        // 1) preferred directions toward target
-        const dirAttempts = [];
-        if (x > me.x) dirAttempts.push('right');
-        if (x < me.x) dirAttempts.push('left');
-        if (y > me.y) dirAttempts.push('up');
-        if (y < me.y) dirAttempts.push('down');
-  
-        // 2) fallback: all four directions, in a fixed but secondary order
-        for (const d of ['up','down','left','right']) {
-          if (!dirAttempts.includes(d)) dirAttempts.push(d);
-        }
-  
-        // 3) prune out the move that would take us back to prevPos
-        if (prevPos) {
-          for (let i = dirAttempts.length-1; i >= 0; i--) {
-            const move = dirAttempts[i];
-            let nx = me.x + (move === 'right' ? 1 : move === 'left' ? -1 : 0);
-            let ny = me.y + (move === 'up' ? 1 : move === 'down' ? -1 : 0);
-            if (nx === prevPos.x && ny === prevPos.y) {
-              dirAttempts.splice(i, 1);
-            }
-          }
-        }
-  
-        // 4) try each remaining direction
-        for (const move of dirAttempts) {
-          const status = await client.emitMove(move);
-          if (status) {
-            // success! record where we came from, update me, and re‑loop
-            prevPos = curr;
-            me.x = status.x;
-            me.y = status.y;
-            continue outer;
-          }
-        }
-  
-        // 5) none worked → truly stuck
-        this.log('stuck at', me, 'cannot move toward', { x, y });
-        throw 'stuck';
-      }
-  
-      return true;
-    }
-  }  
 
 // Plan that executes high-level goals using a PDDL planner
 class PddlPlan extends Plan {
@@ -598,27 +594,268 @@ class PddlPlan extends Plan {
   }
 }
 
-// Simpler plan to go directly to a parcel and pick it up, without PDDL
-class DirectPickup extends Plan {
 
-  // Determines applicability of this plan (only for pickup)
-  static isApplicableTo(goal) {
-    return goal === 'go_pick_up';
+class GoDeliver extends Plan {
+  static isApplicableTo(goal, x, y) {
+    return goal === 'go_deliver';
   }
 
-  // Executes a direct move and pickup sequence
-  async execute(goal, x, y, id) {
-    // If agent is already on the parcel, just pick it up
-    if (me.x === x && me.y === y) {
-      await client.emitPickup();
+  async execute(goal, x, y) {
+    // collect the *active* carried IDs
+    const toDeliver = [...parcels.values()]
+      .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
+      .map(p => p.id);
+
+    if (!toDeliver.length) {
+      this.log('GoDeliver: nothing to deliver (all suspended)');
       return true;
     }
 
-    // Otherwise, go to the parcel location then pick it up
-    await this.subIntention(['go_to', x, y]);
-    await client.emitPickup();
+    // same “try each delivery‐zone with back-off” you already have…
+    const zones = deliveryZones.slice().sort((a,b)=>distance(me,a)-distance(me,b));
+    for (const dz of zones) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          this.log(`GoDeliver → to ${dz.x},${dz.y} [attempt ${attempt}]`);
+          await this.subIntention(['go_to', dz.x, dz.y]);
+          // success!
+          for (const id of toDeliver) suspendedDeliveries.delete(id);
+          await client.emitPutdown();  // drop one by one if you like
+          return true;
+        } catch (_) {
+          this.log(`  GoDeliver: blocked at (${dz.x},${dz.y}) on attempt ${attempt}`);
+        }
+      }
+      this.log(`  GoDeliver: giving up on zone (${dz.x},${dz.y}), trying next`);
+    }
+
+    // if we get here, *all* zones failed → suspend these parcels
+    for (const id of toDeliver) suspendedDeliveries.add(id);
+    this.log('GoDeliver: all zones blocked → suspending delivery of', toDeliver);
+    throw ['stopped'];   // abort so that optionsGeneration will pick something else
+  }
+}
+
+class Patrolling extends Plan {
+  static isApplicableTo(goal) {
+    return goal === 'patrolling';
+  }
+
+  async execute(goal) {
+    if (this.stopped) throw ['stopped'];
+
+    // Try a handful of different sectors
+    for (let sTry = 1; sTry <= MAX_SECTORS_TO_TRY; sTry++) {
+      const [sx, sy] = pickOldestSector();
+      markSector(me.x, me.y);    // mark *current* sector so we age others
+      markSector(sx * SECTOR_SIZE, sy * SECTOR_SIZE); // also mark chosen sector
+
+      // collect all tiles in that sector
+      const x0 = sx * SECTOR_SIZE, y0 = sy * SECTOR_SIZE;
+      const candidates = [];
+      for (const key of mapTiles.keys()) {
+        const [x, y] = key.split(',').map(Number);
+        if (x >= x0 && x < x0 + SECTOR_SIZE
+          && y >= y0 && y < y0 + SECTOR_SIZE) {
+          const tile = mapTiles.get(key);
+          // Filter for type 1 tiles ---
+          if (tile.type === 1) {
+            candidates.push({ x, y });
+          }
+        }
+      }
+
+      if (candidates.length === 0) {
+        this.log(`Patrolling: sector ${sx},${sy} has no spawn-tiles, skipping…`);
+        continue;
+      }
+
+      // try up to MAX_TILES_PER_SECTOR random picks
+      for (let tTry = 1; tTry <= MAX_TILES_PER_SECTOR; tTry++) {
+        if (this.stopped) throw ['stopped'];
+
+        const { x, y } = candidates[Math.floor(Math.random() * candidates.length)];
+        this.log(`Patrolling → sector ${sx},${sy} → attempt ${tTry} @ (${x},${y})`);
+        try {
+          await this.subIntention(['go_to', x, y]);
+          
+          const dirs = [{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+          for (let i = 0; i < SCOUT_STEPS; i++) {
+            if (this.stopped) throw ['stopped'];
+            const {dx,dy} = dirs[Math.floor(Math.random()*4)];
+            const nx = me.x + dx, ny = me.y + dy;
+            const key = `${nx},${ny}`, tile = mapTiles.get(key);
+            if (!tile.locked) {
+              try {
+                this.log(`scouting → (${nx},${ny})`);
+                await this.subIntention(['go_to', nx, ny]);
+              } catch {
+                this.log(`blocked @ (${nx},${ny}), stay put`);
+              }
+            } else {
+              this.log(`skip invalid (${nx},${ny})`);
+            }
+            // small pause so you don’t zip instantly:
+            await new Promise(r => setTimeout(r, 200));
+          }
+
+          this.log('Patrolling: scouting done, ready for next sector');
+          return true;
+
+        } catch {
+          this.log(`  Patrolling: (${x},${y}) blocked, retrying…`);
+          // immediate retry; no setTimeout
+        }
+      }
+
+      this.log(`Patrolling: sector ${sx},${sy} exhausted, picking new sector…`);
+    }
+
+    // all sectors & tiles tried, give up
+    this.log('Patrolling: all sectors exhausted—aborting patrol');
+    throw ['stopped'];
+  }
+}
+
+class AstarMove extends Plan {
+  static isApplicableTo(goal, x, y) {
+    return goal === 'go_to';
+  }
+  async execute(goal, x, y) {
+    const plan = aStarDaemon.aStar(
+      { x: me.x, y: me.y },
+      { x, y },
+      n => Math.abs(n.x - x) + Math.abs(n.y - y)
+    );
+    // console.log('A* plan =', plan);
+
+    if (plan === 'failure' || !Array.isArray(plan) || plan.length === 0) {
+      this.log('AstarMove: no path found → aborting to replan/fallback');
+      throw ['stopped']; 
+    }
+
+    for (const step of plan) {
+      if (this.stopped) throw ['stopped'];
+
+      // --- NEW: Check for parcels/delivery on current tile BEFORE moving ---
+      const currentParcel = [...parcels.values()].find(p => 
+        p.x === me.x && p.y === me.y && !p.carriedBy
+      );
+      
+      // 1) Opportunistic pickup
+      if (currentParcel && !currentParcel.carriedBy) {
+        console.log('Found parcel underfoot during move → picking up');
+        await client.emitPickup();
+      }
+
+      // 2) Opportunistic delivery
+      if (deliveryZones.some(z => z.x === me.x && z.y === me.y)) {
+        const carried = [...parcels.values()].filter(p => 
+          p.carriedBy === me.id
+        );
+        if (carried.length > 0) {
+          console.log('On delivery zone during move → dropping parcels');
+          await client.emitPutdown();
+        }
+      }
+
+      // DEBUG
+      const key = `${step.x},${step.y}`;
+      // console.log(
+      //   '→ next step', step,
+      //   'mapTiles.has=', mapTiles.has(key),
+      //   'tile=', mapTiles.get(key)
+      // );
+
+      // locked‐tile check
+      const tile = mapTiles.get(key);
+      if (tile?.locked) {
+        console.log('  aborting because locked → replanning');
+        throw ['stopped'];
+      }
+
+      const status = await client.emitMove(step.action);
+      // console.log('  emitMove returned', status);
+      if (!status) {
+        console.log('  blocked by wall or collision → replanning');
+        throw ['stopped'];
+      }
+
+      me.x = status.x;
+      me.y = status.y;
+    }
+
     return true;
   }
 }
 
-planLibrary.push(PddlPlan, DirectPickup, GoPickUp, GoDeliver, BlindMove);
+class BulkCollect extends Plan {
+  static isApplicableTo(goal) {
+    return goal === 'bulk_collect';
+  }
+
+  /**
+   * predicate = ['bulk_collect', id1, id2, ..., idN]
+   */
+  async execute(goal, ...ids) {
+    if (this.stopped) throw ['stopped'];
+    this.log('BulkCollect starting…');
+
+    // 1) map IDs to parcel objects (may have moved or been stolen so filter those out)
+    const batch = ids
+      .map(id => parcels.get(id))
+      .filter(p => p && !p.carriedBy);
+
+    if (batch.length === 0) {
+      this.log('BulkCollect: nothing to batch, falling back to patrol');
+      await this.subIntention(['patrolling']);
+      return true;
+    }
+
+    // 2) Walk and pickup each in turn
+    for (const p of batch) {
+      if (this.stopped) throw ['stopped'];
+      this.log(`BulkCollect → heading to pickup ${p.id} @ (${p.x},${p.y})`);
+      if (me.x !== p.x || me.y !== p.y) {
+        await this.subIntention(['go_to', p.x, p.y]);
+      }
+      if (this.stopped) throw ['stopped'];
+      this.log(`BulkCollect → picking up ${p.id}`);
+      const ok = await client.emitPickup();
+      if (!ok) {
+        this.log('BulkCollect: pickup failed — discounting', p.id);
+        const q = parcels.get(p.id);
+        if (q) {
+          q.expectedUtility = q.expectedUtility * CONTEST_PENALTY;
+          parcels.set(p.id, q);
+        }
+        break;
+      }
+      parcels.delete(p.id);
+    }
+
+    // 3) Deliver if we got at least one
+    const carriedCount = batch.length;
+    if (carriedCount && deliveryZones.length) {
+      const dz = deliveryZones.reduce((a, b) =>
+        distance(me, a) < distance(me, b) ? a : b
+      );
+      this.log('BulkCollect → delivering to', dz);
+      await this.subIntention(['go_to', dz.x, dz.y]);
+      for (let i = 0; i < carriedCount; i++) {
+        if (this.stopped) throw ['stopped'];
+        this.log('BulkCollect → putdown parcel');
+        await client.emitPutdown();
+      }
+    }
+
+    this.log('BulkCollect → DONE');
+    return true;
+  }
+}
+planLibrary.push(PddlPlan);
+planLibrary.push(GoPickUp);
+planLibrary.push(Patrolling)
+planLibrary.push(GoDeliver);
+planLibrary.push(AstarMove);
+planLibrary.push(BulkCollect)
