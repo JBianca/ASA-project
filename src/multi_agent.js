@@ -24,12 +24,17 @@ const SCOUT_STEPS = 5;            // scouting steps around parcel-spawning tiles
 
 const suspendedDeliveries = new Set();
 
-const CORRIDOR_LOCK_TTL = 500;
+globalThis.disableCorridorLocks = false;
 let corridorCellMap  = new Map();
 const corridorCellsById = new Map();
 const pendingCorridorPromises = new Map();
 let corridorSegments = [];
-const corridorLocks = {};
+let corridorLocks = {};
+
+const STATE_IDLE             = 'IDLE';
+const STATE_HANDOFF_PENDING  = 'HANDOFF_PENDING';
+const STATE_HANDOFF_ACTIVE   = 'HANDOFF_IN_PROGRESS';
+let state = STATE_IDLE;
 
 client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
@@ -107,6 +112,51 @@ client.onMsg(async (id, name, msg, reply) => {
       } catch (error) {
         console.error(error);
       }
+    }
+  }
+
+  if (msg.action === 'handoff_request') {
+    const { parcels, rendezvous } = msg;
+    state = STATE_HANDOFF_PENDING;
+
+    const tile = mapTiles.get(`${rendezvous.x},${rendezvous.y}`);
+    const occupied = tile?.locked && !(rendezvous.x === agents.get(id)?.x && rendezvous.y === agents.get(id)?.y);
+    const granted = !occupied;
+    console.log(
+      `[${me.name}] ← handoff_request for [${parcels}] at (${rendezvous.x},${rendezvous.y}) ` +
+      `→ granted=${granted}`
+    );
+
+    reply(granted);
+
+    if (granted) {
+      console.log(`[${me.name}] scheduling handoff_execute from=${id}`);
+      const adjacents = getAdjacentUnblocked(rendezvous, mapTiles);
+      let target = adjacents[0];
+      
+      myAgent.unconditionalPush([
+          'handoff_execute',
+          id,          // requester
+          target.x,    // adjacent tile, not rendezvous!
+          target.y,
+          ...parcels
+      ]);
+    }
+    console.log('queue now =', myAgent.intention_queue.map(i=>i.predicate));
+    return;
+  }
+
+  if (msg.action === 'handoff_done') {
+    const { x, y } = msg;
+    const cid = getCorridorId(x, y);
+    if (cid) {
+      // broadcast to yourself as well, not just your teammate
+      client.emitSay(null, {
+        action: 'corridor_release',
+        corridorId: cid,
+        ts: Date.now()
+      });
+      delete corridorLocks[cid];
     }
   }
 
@@ -313,6 +363,20 @@ client.onMap((width, height, tiles) => {
     );
   }
   buildCorridorMap(width, height, tiles);
+  // if there is exactly one corridor that spans the map edge‐to‐edge, assume hallway:
+  // console.log('[DISABLE?] segment length:', corridorSegments[0].cells.length, 'max(width,height):', Math.max(width, height));
+  if (true) {
+    console.log('[DISABLE] hallway detected → disabling all corridor locks');
+    globalThis.disableCorridorLocks = true;
+
+    // clear any existing locks & cells
+    corridorLocks = {};
+    corridorCellsById.clear();
+    corridorCellMap.clear();
+    for (const entry of mapTiles.values()) {
+      entry.corridorLocked = false;
+    }
+  }
 });
 
 function buildCorridorMap(width, height, tiles) {
@@ -373,16 +437,82 @@ async function askCorridorLock(toId, corridorId, owner) {
   });
 }
 
-async function acquireCorridor(cid) {
-  const granted = await askCorridorLock(teamMateId, cid, me.id);
-  if (!granted) throw new Error(`corridor ${cid} denied`);
-  // broadcast to everyone that you now hold it
-  client.emitSay(teamMateId, {
-    action: 'corridor',
-    corridorId: cid,
-    owner: me.id,
-    ts: Date.now()
+function getAdjacentUnblocked(tile, mapTiles) {
+    const directions = [
+        {dx: 1, dy: 0}, {dx: -1, dy: 0}, {dx: 0, dy: 1}, {dx: 0, dy: -1}
+    ];
+    return directions
+        .map(d => ({x: tile.x + d.dx, y: tile.y + d.dy}))
+        .filter(n =>
+            mapTiles.has(`${n.x},${n.y}`) &&
+            !mapTiles.get(`${n.x},${n.y}`).locked &&
+            !mapTiles.get(`${n.x},${n.y}`).corridorLocked &&
+            mapTiles.get(`${n.x},${n.y}`).type === 3
+        );
+}
+
+function chooseReachableMeetpoint() {
+  const mePt = { x: me.x, y: me.y };
+  const matePt = agents.get(teamMateId) || lastSeenMate;
+
+  let best = null;
+  let bestScore = Infinity;
+
+  for (const [key, tile] of mapTiles.entries()) {
+    if (![1, 3].includes(tile.type)) continue;   // Only skip if NOT floor or corridor
+    const [x, y] = key.split(',').map(Number);
+    if (x === mePt.x && y === mePt.y) continue;
+    if (tile.locked || tile.corridorLocked) {
+      continue;
+    }
+
+    const myDist = Math.abs(mePt.x - x) + Math.abs(mePt.y - y);
+    const mateDist = matePt ? (Math.abs(matePt.x - x) + Math.abs(matePt.y - y)) : 0;
+
+    // No need for Infinity check with manhattan
+    const score = myDist + mateDist;
+    if (score < bestScore) {
+      bestScore = score;
+      best = { x, y };
+    }
+  }
+  return best;  // can be null if map is totally blocked
+}
+
+// 2) Updated proposeHandoff: bail if no meet-point or it's unreachable
+async function proposeHandoff(parcelIds) {
+  console.log('[DBG] proposeHandoff called, parcels=', parcelIds);
+  const meet = await chooseReachableMeetpoint();
+  if (!meet) {
+    console.log('[DBG] no valid rendezvous → cancelling handoff');
+    state = STATE_IDLE;
+    return false;
+  }
+  console.log('[DBG] proposeHandoff rendezvous =', meet);
+
+  state = STATE_HANDOFF_PENDING;
+  const granted = await client.emitAsk(teamMateId, {
+    action:     'handoff_request',
+    parcels:    parcelIds,
+    rendezvous: meet,
+    ts:         Date.now()
   });
+  console.log('[DBG] handoff_request reply =', granted);
+
+  if (!granted) {
+    state = STATE_IDLE;
+    console.log('[DBG] handoff denied → back to IDLE');
+    return false;
+  }
+
+  console.log('[DBG] handoff granted, queueing handoff_execute');
+  state = STATE_HANDOFF_PENDING;
+  setImmediate(() => {
+    myAgent.unconditionalPush([
+      'handoff_execute', me.id, meet.x, meet.y, ...parcelIds
+    ]);
+  });
+  console.log('queue now =', myAgent.intention_queue.map(i=>i.predicate));
 }
 
 // When a single tile updates:
@@ -535,13 +665,17 @@ function optionsGeneration() {
   // if the *current* intention is BulkCollect, do nothing (don't replan!)
   // console.log('[opts] all parcels:', [...parcels.keys()]);
   // console.log('[opts] suspended:', Array.from(suspendedDeliveries));
+  if (state === STATE_HANDOFF_PENDING || state === STATE_HANDOFF_ACTIVE) {
+    // console.log('[opts] Skipping option generation—handoff in progress');
+    return;
+  }
 
   const current = myAgent.intention_queue[0];
   if (current && current.predicate[0] !== 'patrolling') {
     return;
   }
 
-  const options   = [];
+  const options = [];
   const assignedToMe = assignParcelsToMe();
 
   const carried = [...parcels.values()]
@@ -564,6 +698,32 @@ function optionsGeneration() {
     const d = Math.abs(p.x - me.x) + Math.abs(p.y - me.y);
     return cnt + (d <= LOCAL_RADIUS ? 1 : 0);
   }, 0);
+
+  // 0) physical handoff?
+  const carriedIds = [...parcels.values()]
+    .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
+    .map(p => p.id);
+
+  if (carriedIds.length && deliveryZones.length) {
+    // pick your closest zone
+    const dz = deliveryZones.reduce((a, b) =>
+      distance(me, a) < distance(me, b) ? a : b
+    );
+
+    // compute solo vs. mate distance
+    const soloDist = Math.abs(me.x - dz.x) + Math.abs(me.y - dz.y);
+    const matePos  = agents.get(teamMateId) || lastSeenMate;
+    if (matePos) {
+      const mateDist = Math.abs(matePos.x - dz.x) + Math.abs(matePos.y - dz.y);
+      
+      // 👉 if teammate can deliver faster, hand off
+      if (mateDist < soloDist) {
+        console.log('[DBG] mateDist < soloDist:', mateDist, '<', soloDist);
+        await proposeHandoff(carriedIds);
+        return;   // drop out of normal planning
+      }
+    }
+  }
 
   // 1) If you're carrying something, go deliver.
   if (carried && deliveryZones.length) {
@@ -623,7 +783,7 @@ function optionsGeneration() {
     }
   }
   else {
-    // Nothing to do: patrol
+    console.log('pushing patrolling from optionsGeneration()');
     options.push(['patrolling']);
   }
 
@@ -687,45 +847,71 @@ class IntentionRevision {
   #intention_queue = [];
   get intention_queue() { return this.#intention_queue; }
 
-  async loop() {
-    let lastActionTime = Date.now();
-    const STUCK_THRESHOLD = 3000; // ms
+async loop() {
+  console.log('Intention loop running, queue:', this.#intention_queue.map(i => i.predicate));
+  let lastActionTime = Date.now();
+  const STUCK_THRESHOLD = 3000; // ms
 
-    while (true) {
-      if (this.intention_queue.length > 0) {
-        const intention = this.intention_queue[0];
-        let id = intention.predicate[3] || intention.predicate[2];
-        let p = parcels.get(id);
-        if (p && p.carriedBy && intention.predicate[0] !== "handoff_pickup") {
-          // Skip this intention if not valid anymore
-          this.intention_queue.shift();
-          continue;
-        }
-        try {
-          await intention.achieve();
-        } catch {}
-        this.intention_queue.shift();
-        lastActionTime = Date.now();
-      } else {
-        // No intention? Trigger planning
-        await optionsGeneration();
-        lastActionTime = Date.now();
-      }
-
-      // Stuck recovery
-      if (Date.now() - lastActionTime > STUCK_THRESHOLD) {
-        console.log("Force resetting intentions due to inactivity");
-        this.#intention_queue = [];
-        await optionsGeneration();
-        lastActionTime = Date.now();
-      }
-
-      await new Promise(res => setImmediate(res));
+  while (true) {
+    // ─── 1) Preempt everything once we enter a handoff ───
+    const first = this.intention_queue[0];
+    if ((state === STATE_HANDOFF_PENDING || state === STATE_HANDOFF_ACTIVE)
+        && first
+        && first.predicate[0] !== 'handoff_execute'
+        && this.intention_queue.some(i => i.predicate[0] === 'handoff_execute')) {
+      console.log('[handoff] preempting to handoff_execute');
+      // stop *all* running plans
+      for (const intent of this.#intention_queue) intent.stop();
+      // keep only the handoff_execute intent in the queue (if it’s there)
+      this.#intention_queue = this.#intention_queue
+        .filter(i => i.predicate[0] === 'handoff_execute');
     }
+
+    // ─── 2) If handoff_execute is queued, run *only* that ───
+    if (this.#intention_queue.length > 0) {
+      const intention = this.#intention_queue[0];
+      let ran = false;
+      try {
+        await intention.achieve();
+        ran = true;
+      } catch (err) {
+        console.log('[LOOP] Exception in achieve:', err);
+        ran = true;
+      }
+      // Only shift if this is STILL the head of the queue!
+      if (this.#intention_queue[0] === intention && ran) {
+        this.#intention_queue.shift();
+      }
+      await new Promise(r => setImmediate(r));
+      continue;
+    }
+
+    // ─── 3) If we’re still in handoff but nothing to execute yet, just wait ───
+    if (state !== STATE_IDLE) {
+      await new Promise(r => setTimeout(r, 50));
+      continue;
+    }
+
+    // ─── 4) Normal planning when truly idle ───
+    await optionsGeneration();
+    lastActionTime = Date.now();
+
+    // ─── 5) Stuck recovery ───
+    if (Date.now() - lastActionTime > STUCK_THRESHOLD) {
+      console.log("Force resetting intentions due to inactivity");
+      this.#intention_queue = [];
+      await optionsGeneration();
+      lastActionTime = Date.now();
+    }
+
+    // small yield so we don’t spin the loop too hard
+    await new Promise(r => setImmediate(r));
   }
+}
 
   // Regular push: avoid queueing the same intention
   async push(predicate) {
+    console.log(`[PUSH] State: ${state}, predicate:`, predicate);
     const last = this.intention_queue.at(-1);
     if (last && last.predicate.join(' ') == predicate.join(' ')) return;
     const intention = new Intention(this, predicate);
@@ -733,6 +919,17 @@ class IntentionRevision {
 
     // If there was a previous intention, stop it so we only follow one at a time
     if (last) last.stop();
+  }
+
+  unconditionalPush(predicate) {
+    console.log(`[UNCONDPUSH] State: ${state}, predicate:`, predicate);
+    for (const intent of this.#intention_queue) {
+      intent.stop();
+    }
+    this.#intention_queue = [];
+    const intent = new Intention(this, predicate);
+    this.#intention_queue.push(intent);
+    console.log('[UNCONDPUSH after]', this.#intention_queue.map(i => i.predicate));
   }
 }
 
@@ -1031,7 +1228,7 @@ class AstarMove extends Plan {
 
         // —— corridor lock logic begins ——
         const cid = getCorridorId(step.x, step.y);
-        if (cid && cid !== prevCorridor) {
+        if (!disableCorridorLocks && cid && cid !== prevCorridor) {
           // request new corridor
           const granted = await askCorridorLock(teamMateId, cid, me.id);
           if (!granted) {
@@ -1082,15 +1279,15 @@ class AstarMove extends Plan {
         const tileKey = `${step.x},${step.y}`;
         const tile = mapTiles.get(tileKey);
 
-        // Wait a few cycles if the tile is locked
+        // Wait a few cycles if the tile is locked 
         let lockWaits = 0;
-        while ((tile?.locked || tile?.corridorLocked) && lockWaits++ < MAX_LOCK_WAIT) {
+        while ((tile?.locked || (!disableCorridorLocks && tile?.corridorLocked)) && lockWaits++ < MAX_LOCK_WAIT) {
           await sleep(30 + Math.random() * 50);
         }
 
         // If still locked, penalize tile and continue with the rest of the plan
-        if (tile?.locked || tile?.corridorLocked) {
-          aStarDaemon.addTempPenalty(step.x, step.y, 10);   //TODO: implement this!
+        if (tile?.locked || (!disableCorridorLocks && tile?.corridorLocked)) {
+          aStarDaemon.addTempPenalty(step.x, step.y, 10);
           await sleep(30 + Math.random() * 50);
           continue;
         }
@@ -1245,7 +1442,53 @@ class BulkCollect extends Plan {
   }
 }
 
+class HandoffExecute extends Plan {
+  static isApplicableTo(goal, from, x, y, ...ids) {
+    return goal === 'handoff_execute';
+  }
 
+  async execute(_, from, x, y, ...ids) {
+    console.log("[HANDOFF] Entering execute for", from, x, y, ids);
+    state = STATE_HANDOFF_ACTIVE;
+    try {
+      console.log(`[${me.name}] ▶ handoff_execute → rendezvous (${x},${y})`);
+      if (me.x === x && me.y === y) {
+        console.log(`[${me.name}] ▶ already at rendezvous`);
+      } else {
+        try {
+          await this.subIntention(['go_to', x, y]);
+        } catch (err) {
+          console.log(`[${me.name}] ✘ rendezvous unreachable → abort handoff`);
+          return false;  // bail softly
+        }
+      }
+
+      if (me.id === from) {
+        for (const id of ids) {
+          console.log(`[${me.name}] ▶ putdown ${id}`);
+          await client.emitPutdown();
+        }
+      } else {
+        for (const id of ids) {
+          console.log(`[${me.name}] ▶ pickup ${id}`);
+          await client.emitPickup();
+        }
+      }
+
+      client.emitSay(teamMateId, {
+        action:  'handoff_done',
+        from, x, y,
+        parcels: ids
+      });
+    } catch (err) {
+      console.log("[HANDOFF] Exception:", err);
+      throw err;
+    } finally {
+      state = STATE_IDLE;
+    }
+    return true;
+  }
+}
 
 planLibrary.push(GoPickUp);
 planLibrary.push(Patrolling)

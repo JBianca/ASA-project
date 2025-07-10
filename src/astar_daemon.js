@@ -130,7 +130,7 @@ class AStarDaemon {
         const tile = this.map.get(k);
 
         // Skip out-of-bounds, walls, or occupied tiles
-        if (!tile || tile.type === 0 || tile.locked || tile.corridorLocked) {
+        if (!tile || tile.type === 0 || tile.locked || (!disableCorridorLocks && tile.corridorLocked)) {
           continue;
         }
 
