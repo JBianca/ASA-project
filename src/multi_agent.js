@@ -116,33 +116,33 @@ client.onMsg(async (id, name, msg, reply) => {
   }
 
   if (msg.action === 'handoff_request') {
-    const { parcels, rendezvous } = msg;
-    state = STATE_HANDOFF_PENDING;
+    const { parcels, rendezvous, giverSpot, recvSpot } = msg;
 
     const tile = mapTiles.get(`${rendezvous.x},${rendezvous.y}`);
-    const occupied = tile?.locked && !(rendezvous.x === agents.get(id)?.x && rendezvous.y === agents.get(id)?.y);
-    const granted = !occupied;
-    console.log(
-      `[${me.name}] ← handoff_request for [${parcels}] at (${rendezvous.x},${rendezvous.y}) ` +
-      `→ granted=${granted}`
-    );
-
-    reply(granted);
-
-    if (granted) {
-      console.log(`[${me.name}] scheduling handoff_execute from=${id}`);
-      const adjacents = getAdjacentUnblocked(rendezvous, mapTiles);
-      let target = adjacents[0];
-      
-      myAgent.unconditionalPush([
-          'handoff_execute',
-          id,          // requester
-          target.x,    // adjacent tile, not rendezvous!
-          target.y,
-          ...parcels
-      ]);
+    const occupied = tile?.locked
+      && !(rendezvous.x === agents.get(id)?.x && rendezvous.y === agents.get(id)?.y);
+    if (occupied) {
+      console.log(`[${me.name}] ← handoff_request denied (tile occupied)`);
+      reply(false);
+      return;
     }
-    console.log('queue now =', myAgent.intention_queue.map(i=>i.predicate));
+
+    const mySpot = recvSpot || rendezvous;
+    reply(true);
+    state = STATE_HANDOFF_PENDING;
+
+    console.log(
+      `[${me.name}] ← handoff_request granted; moving to waiting spot (${mySpot.x},${mySpot.y})`
+    );
+    myAgent.unconditionalPush([
+      'handoff_execute',
+      id,
+      mySpot.x, mySpot.y,
+      rendezvous.x, rendezvous.y,
+      ...parcels
+    ]);
+
+    console.log('queue now =', myAgent.intention_queue.map(i => i.predicate));
     return;
   }
 
@@ -437,46 +437,61 @@ async function askCorridorLock(toId, corridorId, owner) {
   });
 }
 
-function getAdjacentUnblocked(tile, mapTiles) {
-    const directions = [
-        {dx: 1, dy: 0}, {dx: -1, dy: 0}, {dx: 0, dy: 1}, {dx: 0, dy: -1}
-    ];
-    return directions
-        .map(d => ({x: tile.x + d.dx, y: tile.y + d.dy}))
-        .filter(n =>
-            mapTiles.has(`${n.x},${n.y}`) &&
-            !mapTiles.get(`${n.x},${n.y}`).locked &&
-            !mapTiles.get(`${n.x},${n.y}`).corridorLocked &&
-            mapTiles.get(`${n.x},${n.y}`).type === 3
-        );
+function findAdjacentSpots(center, k = 2) {
+  const dirs = [ {dx:1,dy:0}, {dx:-1,dy:0}, {dx:0,dy:1}, {dx:0,dy:-1} ];
+  const spots = [];
+  for (const {dx,dy} of dirs) {
+    const x = center.x + dx, y = center.y + dy;
+    const tile = mapTiles.get(`${x},${y}`);
+    if (
+      tile
+      && [1,3].includes(tile.type)
+      && !tile.locked
+      && !tile.corridorLocked
+      // don’t pick a spot someone’s standing on:
+      && !(x===me.x && y===me.y)
+      && !(agents.get(teamMateId)?.x===x && agents.get(teamMateId)?.y===y)
+    ) {
+      spots.push({ x, y });
+      if (spots.length === k) break;
+    }
+  }
+  return spots;  // maybe length < k if not enough free
 }
 
 function chooseReachableMeetpoint() {
   const mePt = { x: me.x, y: me.y };
   const matePt = agents.get(teamMateId) || lastSeenMate;
-
   let best = null;
   let bestScore = Infinity;
 
   for (const [key, tile] of mapTiles.entries()) {
-    if (![1, 3].includes(tile.type)) continue;   // Only skip if NOT floor or corridor
-    const [x, y] = key.split(',').map(Number);
-    if (x === mePt.x && y === mePt.y) continue;
-    if (tile.locked || tile.corridorLocked) {
-      continue;
-    }
+    if (![1,3].includes(tile.type)) continue;
+    const [x,y] = key.split(',').map(Number);
 
-    const myDist = Math.abs(mePt.x - x) + Math.abs(mePt.y - y);
-    const mateDist = matePt ? (Math.abs(matePt.x - x) + Math.abs(matePt.y - y)) : 0;
+    if ((x===mePt.x && y===mePt.y) ||
+        (matePt && x===matePt.x && y===matePt.y)) continue;
+    if (tile.locked || tile.corridorLocked) continue;
 
-    // No need for Infinity check with manhattan
-    const score = myDist + mateDist;
+    // here’s the change → use findAdjacentSpots to require two free side-spots
+    const neighbors = findAdjacentSpots({ x, y }, 2);
+    if (neighbors.length < 2) continue;
+
+    // (optional) check reachability if you like…
+    const myPath = aStarDaemon.aStar(mePt,   {x,y}, n=>distance(n,{x,y}));
+    const matePath = matePt
+      ? aStarDaemon.aStar(matePt, {x,y}, n=>distance(n,{x,y}))
+      : [];
+    if (!myPath || !matePath) continue;
+
+    const score = myPath.length + matePath.length;
     if (score < bestScore) {
       bestScore = score;
       best = { x, y };
     }
   }
-  return best;  // can be null if map is totally blocked
+
+  return best;
 }
 
 // 2) Updated proposeHandoff: bail if no meet-point or it's unreachable
@@ -488,13 +503,22 @@ async function proposeHandoff(parcelIds) {
     state = STATE_IDLE;
     return false;
   }
-  console.log('[DBG] proposeHandoff rendezvous =', meet);
+  console.log('[DBG] meet-up point: ', meet);
+  const spots = findAdjacentSpots(meet, 2);
+  if (spots.length < 2) {
+    console.log('[DBG] Not enough free side-spots → abort handoff');
+    return false;
+  }
+  // assign one spot to *you*, one to the teammate:
+  const [mySpot, theirSpot] = spots;
 
   state = STATE_HANDOFF_PENDING;
   const granted = await client.emitAsk(teamMateId, {
     action:     'handoff_request',
     parcels:    parcelIds,
     rendezvous: meet,
+    giverSpot:  mySpot,
+    recvSpot:   theirSpot,
     ts:         Date.now()
   });
   console.log('[DBG] handoff_request reply =', granted);
@@ -509,7 +533,10 @@ async function proposeHandoff(parcelIds) {
   state = STATE_HANDOFF_PENDING;
   setImmediate(() => {
     myAgent.unconditionalPush([
-      'handoff_execute', me.id, meet.x, meet.y, ...parcelIds
+      'handoff_execute', me.id,
+        mySpot.x, mySpot.y,
+        meet.x, meet.y,
+        ...parcelIds
     ]);
   });
   console.log('queue now =', myAgent.intention_queue.map(i=>i.predicate));
@@ -1359,7 +1386,7 @@ class AstarMove extends Plan {
     // Opportunistically pick up parcel at current location if reward is still good
     if (carried.length < 3) {
       const parcelHere = [...parcels.values()].find(p =>
-        p.x === me.x && p.y === me.y && !p.carriedBy
+        p.x === me.x && p.y === me.y && !p.carriedBy && !suspendedDeliveries.has(p.id)
       );
       if (parcelHere && parcelHere.reward > 5) {
         console.log('Opportunistic pickup');
@@ -1392,7 +1419,11 @@ class BulkCollect extends Plan {
     // 1) map IDs to parcel objects (may have moved or been stolen so filter those out)
     const batch = ids
       .map(id => parcels.get(id))
-      .filter(p => p && !p.carriedBy);
+      .filter(p =>
+        p &&
+        !p.carriedBy &&
+        !suspendedDeliveries.has(p.id)    // <-- skip suspended
+      );
 
     if (batch.length === 0) {
       this.log('BulkCollect: nothing to batch, falling back to patrol');
@@ -1447,47 +1478,36 @@ class HandoffExecute extends Plan {
     return goal === 'handoff_execute';
   }
 
-  async execute(_, from, x, y, ...ids) {
-    console.log("[HANDOFF] Entering execute for", from, x, y, ids);
-    state = STATE_HANDOFF_ACTIVE;
-    try {
-      console.log(`[${me.name}] ▶ handoff_execute → rendezvous (${x},${y})`);
-      if (me.x === x && me.y === y) {
-        console.log(`[${me.name}] ▶ already at rendezvous`);
-      } else {
-        try {
-          await this.subIntention(['go_to', x, y]);
-        } catch (err) {
-          console.log(`[${me.name}] ✘ rendezvous unreachable → abort handoff`);
-          return false;  // bail softly
-        }
-      }
+  async execute(_, from, waitX, waitY, meetX, meetY, ...ids) {
+  state = STATE_HANDOFF_ACTIVE;
+  try {
+    // 1) both move to their assigned wait-spots
+    await this.subIntention(['go_to', waitX, waitY]);
 
-      if (me.id === from) {
-        for (const id of ids) {
-          console.log(`[${me.name}] ▶ putdown ${id}`);
-          await client.emitPutdown();
-        }
-      } else {
-        for (const id of ids) {
-          console.log(`[${me.name}] ▶ pickup ${id}`);
-          await client.emitPickup();
-        }
+    // 2) then the *giver* proceeds to the actual tile to drop,
+    //    while the *receiver* waits one extra beat,
+    if (me.id === from) {
+      await this.subIntention(['go_to', meetX, meetY]);
+      for (const id of ids) {
+        await client.emitPutdown();
+        suspendedDeliveries.add(id);
       }
-
-      client.emitSay(teamMateId, {
-        action:  'handoff_done',
-        from, x, y,
-        parcels: ids
-      });
-    } catch (err) {
-      console.log("[HANDOFF] Exception:", err);
-      throw err;
-    } finally {
-      state = STATE_IDLE;
+    } else {
+      // pause until you see the giver drop
+      await new Promise(r => setTimeout(r, 200));
+      await this.subIntention(['go_to', meetX, meetY]);
+      for (const id of ids) {
+        await client.emitPickup();
+      }
     }
-    return true;
+
+    // 3) notify & cleanup?
+    client.emitSay(teamMateId, { action:'handoff_done', parcels:ids });
+  } finally {
+    state = STATE_IDLE;
   }
+  return true;
+  } 
 }
 
 planLibrary.push(GoPickUp);
