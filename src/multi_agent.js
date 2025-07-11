@@ -687,7 +687,7 @@ function assignParcelsToMe() {
   return assigned;
 }
 
-function optionsGeneration() {
+async function optionsGeneration() {
   // console.trace(`[${me.name}] optionsGeneration()`);
   // if the *current* intention is BulkCollect, do nothing (don't replan!)
   // console.log('[opts] all parcels:', [...parcels.keys()]);
@@ -1515,3 +1515,4 @@ planLibrary.push(Patrolling)
 planLibrary.push(GoDeliver);
 planLibrary.push(AstarMove);
 planLibrary.push(BulkCollect);
+planLibrary.push(HandoffExecute);
