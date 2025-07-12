@@ -474,81 +474,74 @@ function findAdjacentSpots(center, k = 2) {
 }
 
 async function chooseCorridorMeetpoint(retries = 10, waitMs = 200) {
-  const mePt = { x: me.x, y: me.y };
+  const mePt   = { x: me.x, y: me.y };
   const matePt = agents.get(teamMateId) || lastSeenMate;
-  const cid = getCorridorOrNearbyId(mePt.x, mePt.y) || (matePt && getCorridorOrNearbyId(matePt.x, matePt.y));
 
-  // console.log("chooseCorridorMeetpoint: me at", mePt, "mate at", matePt, "cid:", cid);
+  // 1) which corridor are _either_ of us in?
+  const cid = getCorridorId(mePt.x, mePt.y)
+           || (matePt && getCorridorId(matePt.x, matePt.y));
   if (cid) {
+    // pull out all the cells in that corridor, in order
     const keyList = corridorCellsById.get(cid) || [];
     const coords = keyList.map(k => {
-      const [x, y] = k.split(',').map(Number);
-      return { x, y };
+      const [x,y] = k.split(',').map(Number);
+      return { x,y };
     });
-    // Corridor is vertical if all x's are the same
     const vertical = coords.every(c => c.x === coords[0].x);
-    coords.sort((a, b) => vertical ? (a.y - b.y) : (a.x - b.x));
-    const mid = coords[Math.floor(coords.length / 2)];
+    coords.sort((a,b) => vertical ? (a.y-b.y) : (a.x-b.x));
 
-    // 1. Try the midpoint (with retries)
-    for (let attempt = 0; attempt < retries; ++attempt) {
-      const candidates = findAdjacentSpots(mid, 1);
-      if (candidates.length > 0) {
-        if (attempt > 0) console.log(`Midpoint became free after ${attempt+1} tries`);
-        return { x: mid.x, y: mid.y, waitSpot: candidates[0] };
+    // 2) find your indices in that sorted list (snap to nearest)
+    function findIndex(pt) {
+      return coords.findIndex(c =>
+        Math.abs(c.x - pt.x) < 0.5 && Math.abs(c.y - pt.y) < 0.5
+      );
+    }
+    let i1 = findIndex(mePt), i2 = findIndex(matePt);
+    if (i1 < 0) i1 = 0;
+    if (i2 < 0) i2 = coords.length-1;
+
+    // 3) take the sub‐array between you & your mate
+    const [start,end] = i1 < i2 ? [i1,i2] : [i2,i1];
+    const segment = coords.slice(start, end+1);
+
+    // 4) pick its midpoint
+    const midIdx = Math.floor(segment.length/2);
+    const mid    = segment[midIdx];
+
+    // 5) exactly as before: try the mid with retries
+    for (let attempt=0; attempt<retries; ++attempt) {
+      const adj = findAdjacentSpots(mid,1);
+      if (adj.length) {
+        if (attempt>0) console.log(`Midpoint freed after ${attempt+1} tries`);
+        return { x: mid.x, y: mid.y, waitSpot: adj[0] };
       }
-      if (attempt === 0) console.log("Midpoint occupied, retrying...");
+      if (attempt===0) console.log('Midpoint occupied, retrying…');
       await sleep(waitMs);
     }
 
-    // 2. Try all corridor cells, sorted by distance to mid
-    const scored = coords
-      .filter(tile =>
-        // Ignore where agents are standing
-        !(tile.x === mePt.x && tile.y === mePt.y) &&
-        !(matePt && tile.x === matePt.x && tile.y === matePt.y)
-      )
-      .map(tile => ({
-        tile,
-        dist: Math.abs(tile.x - mid.x) + Math.abs(tile.y - mid.y)
-      }))
-      .sort((a, b) => a.dist - b.dist);
-
-    for (const { tile } of scored) {
-      const adj = findAdjacentSpots(tile, 1);
-      if (adj.length > 0) {
-        console.log("Using available corridor cell at", tile.x, tile.y);
-        return { x: tile.x, y: tile.y, waitSpot: adj[0] };
+    // 6) if still no go, fall back to nearest‐to‐midpoint on that segment
+    let best = null, bestDist = Infinity;
+    for (const tile of segment) {
+      if ((tile.x===mePt.x&&tile.y===mePt.y) ||
+          (matePt && tile.x===matePt.x&&tile.y===matePt.y))
+        continue;
+      const adj = findAdjacentSpots(tile,1);
+      if (!adj.length) continue;
+      const d = Math.abs(tile.x-mid.x)+Math.abs(tile.y-mid.y);
+      if (d < bestDist) {
+        bestDist = d;
+        best     = { x: tile.x, y: tile.y, waitSpot: adj[0] };
       }
     }
-
-    // 3. If *none* found, fallback
-    console.log("No available corridor cell for handoff, falling back.");
-  }
-
-  // 4. Fallback logic (as before)
-  let fallback = null, bestScore = Infinity;
-  for (const [key, tile] of mapTiles.entries()) {
-    if (tile.type !== 3 || tile.locked || tile.corridorLocked) continue;
-    const [x, y] = key.split(',').map(Number);
-    if ((x === mePt.x && y === mePt.y) ||
-        (matePt && x === matePt.x && y === matePt.y)) continue;
-    const neigh = findAdjacentSpots({ x, y }, 1);
-    if (neigh.length < 1) continue;
-    const myDist = Math.abs(mePt.x - x) + Math.abs(mePt.y - y);
-    const mateDist = matePt
-      ? Math.abs(matePt.x - x) + Math.abs(matePt.y - y)
-      : 0;
-    const score = myDist + mateDist;
-    if (score < bestScore) {
-      bestScore = score;
-      fallback = { x, y, waitSpot: neigh[0] };
+    if (best) {
+      console.log('Using available segment cell at', best.x, best.y);
+      return best;
     }
+
+    console.log('No free spot inside segment, falling back to full-corridor logic');
   }
-  if (fallback) {
-    console.log("Using fallback non-corridor meetpoint at", fallback.x, fallback.y);
-  }
-  return fallback;
+
+  return null;
 }
 
 async function proposeHandoff(parcelIds) {
@@ -621,26 +614,26 @@ client.onAgentsSensing(sensedAgents => {
     }
   }
   else {
-    // ─── 1) Otherwise, disable locks if both agents share the same corridor ───
-    const myCid = getCorridorId(me.x, me.y);
+    const useNearby = (corridorSegments.length === 1);
     const mateObj = agents.get(teamMateId) || lastSeenMate;
-    const mateCid = mateObj && getCorridorOrNearbyId(mateObj.x, mateObj.y);
+    const myCid = getCorridorId(me.x, me.y) || (useNearby ? getCorridorOrNearbyId(me.x, me.y) : null);
+    const mateCid = mateObj && (getCorridorId(mateObj.x, mateObj.y) || (useNearby ? getCorridorOrNearbyId(mateObj.x, mateObj.y) : null));
 
     if (myCid && mateCid && myCid === mateCid) {
+      // you’re together in corridor → defer re-locking
       lastSharedCorridorAt = Date.now();
       if (!globalThis.disableCorridorLocks) {
-        console.log(`[DISABLE] both agents are in corridor ${myCid} → suspending locks`);
+        console.log(`[DISABLE] shared corridor ${myCid} → suspending locks`);
         globalThis.disableCorridorLocks = true;
         corridorLocks = {};
-        for (const tile of mapTiles.values()) {
-          tile.corridorLocked = false;
-        }
+        for (const tile of mapTiles.values()) tile.corridorLocked = false;
       }
-    } else if (Date.now() - lastSharedCorridorAt > HYSTERESIS_MS) {
-      if (globalThis.disableCorridorLocks) {
-        globalThis.disableCorridorLocks = false;
-        console.log('[ENABLE] re-enabling corridor locks');
-      }
+    }
+    else if (globalThis.disableCorridorLocks
+             && Date.now() - lastSharedCorridorAt > HYSTERESIS_MS) {
+      // you’ve been out of shared corridor for > hysteresis → re-enable
+      globalThis.disableCorridorLocks = false;
+      console.log('[ENABLE] re-enabling corridor locks');
     }
   }
 
@@ -808,28 +801,32 @@ async function optionsGeneration() {
     return cnt + (d <= LOCAL_RADIUS ? 1 : 0);
   }, 0);
 
-  // 0) physical handoff?
   const carriedIds = [...parcels.values()]
-    .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
-    .map(p => p.id);
+  .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
+  .map(p => p.id);
 
   if (carriedIds.length && deliveryZones.length) {
-    // pick your closest zone
-    const dz = deliveryZones.reduce((a, b) =>
-      distance(me, a) < distance(me, b) ? a : b
-    );
+    // 1) Are we both on the same corridor?
+    const useNearby = (corridorSegments.length === 1);
+    const mateObj = agents.get(teamMateId) || lastSeenMate;
+    const myCid = getCorridorId(me.x, me.y) || (useNearby ? getCorridorOrNearbyId(me.x, me.y) : null);
+    const mateCid = mateObj && (getCorridorId(mateObj.x, mateObj.y) || (useNearby ? getCorridorOrNearbyId(mateObj.x, mateObj.y) : null));
+    console.log("CORRIDOR IDs: ", myCid, mateCid);
 
-    // compute solo vs. mate distance
-    const soloDist = Math.abs(me.x - dz.x) + Math.abs(me.y - dz.y);
-    const matePos  = agents.get(teamMateId) || lastSeenMate;
-    if (matePos) {
-      const mateDist = Math.abs(matePos.x - dz.x) + Math.abs(matePos.y - dz.y);
-      
-      // if teammate can deliver faster, hand off
+    if (myCid && mateCid && myCid === mateCid) {
+      console.log("Agents in the same corridor!");
+      // 2) Only *then* decide if it’s worth handing off
+      const dz = deliveryZones.reduce((a, b) =>
+        distance(me, a) < distance(me, b) ? a : b
+      );
+      const soloDist = Math.abs(me.x - dz.x) + Math.abs(me.y - dz.y);
+      const mateDist = mateObj
+        ? Math.abs(mateObj.x - dz.x) + Math.abs(mateObj.y - dz.y)
+        : Infinity;
+
       if (mateDist < soloDist) {
-        // console.log('[DBG] mateDist < soloDist:', mateDist, '<', soloDist);
         await proposeHandoff(carriedIds);
-        return;   // drop out of normal planning
+        return;
       }
     }
   }
@@ -892,22 +889,25 @@ async function optionsGeneration() {
     }
   }
   else {
-    // ─── FALLBACK: grab the nearest parcel, no matter what ───
-    const allParcels = [...parcels.values()]
-      .filter(p => !p.carriedBy && !suspendedDeliveries.has(p.id));
-    if (allParcels.length > 0) {
-      // sort by Manhattan distance
-      allParcels.sort((a,b) =>
-        (Math.abs(a.x - me.x) + Math.abs(a.y - me.y))
-        - (Math.abs(b.x - me.x) + Math.abs(b.y - me.y))
-      );
-      const p = allParcels[0];
-      console.log(`[FALLBACK] no high-value parcels → grabbing nearest ${p.id} @(${p.x},${p.y})`);
-      options.push(['go_pick_up', p.x, p.y, p.id]);
-    } else {
-      // console.log('pushing patrolling from optionsGeneration()');
-      options.push(['patrolling']);
+    const noDecay = Number.isNaN(DECAY_INTERVAL_MS);
+    if (noDecay) {
+      // (only in the totally flat‐utility regime)
+      const all = [...parcels.values()].filter(p => !p.carriedBy && !suspendedDeliveries.has(p.id));
+      if (all.length) {
+        all.sort((a,b) =>
+          (Math.abs(a.x - me.x) + Math.abs(a.y - me.y))
+          - (Math.abs(b.x - me.x) + Math.abs(b.y - me.y))
+        );
+        const p = all[0];
+        console.log(`[FALLBACK] no utility → grabbing nearest ${p.id} @(${p.x},${p.y})`);
+        options.push(['go_pick_up', p.x, p.y, p.id]);
+      } else {
+        console.log('pushing patrolling (no parcels left)');
+        options.push(['patrolling']);
+      }
     }
+    // console.log('pushing patrolling from optionsGeneration()');
+    options.push(['patrolling']);
   }
 
   // 4) don’t re‐push the same intention twice
@@ -998,7 +998,7 @@ async loop() {
         await intention.achieve();
         ran = true;
       } catch (err) {
-        console.log('[LOOP] Exception in achieve:', err);
+        // console.log('[LOOP] Exception in achieve:', err);
         ran = true;
       }
       // Only shift if this is STILL the head of the queue!
@@ -1034,7 +1034,7 @@ async loop() {
 
   // Regular push: avoid queueing the same intention
   async push(predicate) {
-    console.log(`[PUSH] State: ${state}, predicate:`, predicate);
+    // console.log(`[PUSH] State: ${state}, predicate:`, predicate);
     const last = this.intention_queue.at(-1);
     if (last && last.predicate.join(' ') == predicate.join(' ')) return;
     const intention = new Intention(this, predicate);
@@ -1359,7 +1359,7 @@ class AstarMove extends Plan {
 
         // —— corridor lock logic begins ——
         const cid = getCorridorId(step.x, step.y);
-        if (!disableCorridorLocks && cid && cid !== prevCorridor) {
+        if (!globalThis.disableCorridorLocks && cid && cid !== prevCorridor) {
           // request new corridor
           const granted = await askCorridorLock(teamMateId, cid, me.id);
           if (!granted) {
@@ -1412,12 +1412,12 @@ class AstarMove extends Plan {
 
         // Wait a few cycles if the tile is locked 
         let lockWaits = 0;
-        while ((tile?.locked || (!disableCorridorLocks && tile?.corridorLocked)) && lockWaits++ < MAX_LOCK_WAIT) {
+        while ((tile?.locked || (!globalThis.disableCorridorLocks && tile?.corridorLocked)) && lockWaits++ < MAX_LOCK_WAIT) {
           await sleep(30 + Math.random() * 50);
         }
 
         // If still locked, penalize tile and continue with the rest of the plan
-        if (tile?.locked || (!disableCorridorLocks && tile?.corridorLocked)) {
+        if (tile?.locked || (!globalThis.disableCorridorLocks && tile?.corridorLocked)) {
           aStarDaemon.addTempPenalty(step.x, step.y, 10);
           await sleep(30 + Math.random() * 50);
           continue;
@@ -1499,6 +1499,12 @@ class AstarMove extends Plan {
       if (parcelHere && parcelHere.reward > 5) {
         console.log('Opportunistic pickup');
         await client.emitPickup();
+        const dz = deliveryZones.reduce((a,b) =>
+          distance(me,a) < distance(me,b) ? a : b
+        );
+        console.log('→ scheduling immediate delivery to', dz);
+        myAgent.push(['go_deliver', dz.x, dz.y]);
+        return;
       }
     }
 
@@ -1609,6 +1615,14 @@ class HandoffExecute extends Plan {
   async execute(_, from, waitX, waitY, meetX, meetY, ...ids) {
     state = STATE_HANDOFF_ACTIVE;
     console.log(`[HANDOFF_EXECUTE] me.id=${me.id}  from=${from}  ids=${ids}`);
+    const cid = getCorridorId(meetX, meetY);
+    if (cid) {
+      for (const key of corridorCellsById.get(cid) || []) {
+        const tile = mapTiles.get(key);
+        if (tile) tile.corridorLocked = false;
+      }
+      console.log(`[HANDOFF_EXECUTE] cleared locks on corridor ${cid}`);
+    }
     ids.forEach(pid => handoffInProgressParcels.add(pid));
     startHandoffTimeout();
 
@@ -1721,7 +1735,7 @@ class HandoffExecute extends Plan {
 
       // Common: reset state and suspend patrol if receiver
       if (me.id !== from) {
-        suspendPatrolUntil = Date.now() + 5000;
+        suspendPatrolUntil = Date.now() + 3000;
       }
     } finally {
       ids.forEach(pid => handoffInProgressParcels.delete(pid));
