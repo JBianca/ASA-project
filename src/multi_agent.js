@@ -587,8 +587,6 @@ async function proposeHandoff(parcelIds) {
   return true;
 }
 
-let lastSharedCorridorAt = 0;
-const HYSTERESIS_MS = 5000;
 const agents = new Map();
 client.onAgentsSensing(sensedAgents => {
   // Update agent positions
@@ -602,38 +600,21 @@ client.onAgentsSensing(sensedAgents => {
     if (!seenIds.has(id)) agents.delete(id);
   }
 
-  // ─── 0) If in a handoff, always disable corridor locks ───
-  if (state === STATE_HANDOFF_PENDING || state === STATE_HANDOFF_ACTIVE) {
-    if (!globalThis.disableCorridorLocks) {
-      console.log('[FORCE] in handoff → disabling corridor locks');
-      globalThis.disableCorridorLocks = true;
-      corridorLocks = {};
-      for (const tile of mapTiles.values()) {
-        tile.corridorLocked = false;
-      }
-    }
-  }
-  else {
-    const useNearby = (corridorSegments.length === 1);
-    const mateObj = agents.get(teamMateId) || lastSeenMate;
-    const myCid = getCorridorId(me.x, me.y) || (useNearby ? getCorridorOrNearbyId(me.x, me.y) : null);
-    const mateCid = mateObj && (getCorridorId(mateObj.x, mateObj.y) || (useNearby ? getCorridorOrNearbyId(mateObj.x, mateObj.y) : null));
+  const singleCorridor = (corridorSegments.length === 1);
+  const mateObj = agents.get(teamMateId) || lastSeenMate;
+  const myStrict = getCorridorId(me.x, me.y);
+  const mateStrict = mateObj && getCorridorId(mateObj.x, mateObj.y);
 
-    if (myCid && mateCid && myCid === mateCid) {
-      // you’re together in corridor → defer re-locking
-      lastSharedCorridorAt = Date.now();
-      if (!globalThis.disableCorridorLocks) {
-        console.log(`[DISABLE] shared corridor ${myCid} → suspending locks`);
-        globalThis.disableCorridorLocks = true;
-        corridorLocks = {};
-        for (const tile of mapTiles.values()) tile.corridorLocked = false;
-      }
-    }
-    else if (globalThis.disableCorridorLocks
-             && Date.now() - lastSharedCorridorAt > HYSTERESIS_MS) {
-      // you’ve been out of shared corridor for > hysteresis → re-enable
-      globalThis.disableCorridorLocks = false;
-      console.log('[ENABLE] re-enabling corridor locks');
+  const myCid = myStrict || (singleCorridor ? getCorridorOrNearbyId(me.x, me.y) : null);
+  const mateCid = mateStrict || (singleCorridor ? getCorridorOrNearbyId(mateObj.x, mateObj.y) : null);
+
+  if (myCid && mateCid && myCid === mateCid) {
+    // console.log(`[DISABLE] both agents in corridor ${myCid} → disabling locks permanently`);
+    globalThis.disableCorridorLocks = true;
+
+    corridorLocks = {};
+    for (const tile of mapTiles.values()) {
+      tile.corridorLocked = false;
     }
   }
 
@@ -801,32 +782,28 @@ async function optionsGeneration() {
     return cnt + (d <= LOCAL_RADIUS ? 1 : 0);
   }, 0);
 
+  // 0) physical handoff?
   const carriedIds = [...parcels.values()]
-  .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
-  .map(p => p.id);
+    .filter(p => p.carriedBy === me.id && !suspendedDeliveries.has(p.id))
+    .map(p => p.id);
 
-  if (carriedIds.length && deliveryZones.length) {
-    // 1) Are we both on the same corridor?
-    const useNearby = (corridorSegments.length === 1);
-    const mateObj = agents.get(teamMateId) || lastSeenMate;
-    const myCid = getCorridorId(me.x, me.y) || (useNearby ? getCorridorOrNearbyId(me.x, me.y) : null);
-    const mateCid = mateObj && (getCorridorId(mateObj.x, mateObj.y) || (useNearby ? getCorridorOrNearbyId(mateObj.x, mateObj.y) : null));
-    console.log("CORRIDOR IDs: ", myCid, mateCid);
+  if (globalThis.disableCorridorLocks && carriedIds.length && deliveryZones.length) {
+    // pick your closest zone
+    const dz = deliveryZones.reduce((a, b) =>
+      distance(me, a) < distance(me, b) ? a : b
+    );
 
-    if (myCid && mateCid && myCid === mateCid) {
-      console.log("Agents in the same corridor!");
-      // 2) Only *then* decide if it’s worth handing off
-      const dz = deliveryZones.reduce((a, b) =>
-        distance(me, a) < distance(me, b) ? a : b
-      );
-      const soloDist = Math.abs(me.x - dz.x) + Math.abs(me.y - dz.y);
-      const mateDist = mateObj
-        ? Math.abs(mateObj.x - dz.x) + Math.abs(mateObj.y - dz.y)
-        : Infinity;
-
+    // compute solo vs. mate distance
+    const soloDist = Math.abs(me.x - dz.x) + Math.abs(me.y - dz.y);
+    const matePos = agents.get(teamMateId) || lastSeenMate;
+    if (matePos) {
+      const mateDist = Math.abs(matePos.x - dz.x) + Math.abs(matePos.y - dz.y);
+      
+      // if teammate can deliver faster, hand off
       if (mateDist < soloDist) {
+        console.log('[DBG] mateDist < soloDist:', mateDist, '<', soloDist);
         await proposeHandoff(carriedIds);
-        return;
+        return;   // drop out of normal planning
       }
     }
   }
@@ -1196,7 +1173,17 @@ if (!toDeliver.length) {
     }
 
     // same “try each delivery‐zone with back-off” you already have…
-    const zones = deliveryZones.slice().sort((a,b)=>distance(me,a)-distance(me,b));
+    const reachableZones = deliveryZones
+      .filter(z => {
+        const path = aStarDaemon.aStar(
+          { x: me.x, y: me.y },
+          { x: z.x, y: z.y },
+          n => Math.abs(n.x - z.x) + Math.abs(n.y - z.y)
+        );
+        return Array.isArray(path) && path.length > 0;
+      })
+      .sort((a,b)=> distance(me,a) - distance(me,b));
+    const zones = reachableZones;
     for (const dz of zones) {
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
@@ -1234,42 +1221,58 @@ class Patrolling extends Plan {
       markSector(me.x, me.y);    // mark *current* sector so we age others
       markSector(sx * SECTOR_SIZE, sy * SECTOR_SIZE); // also mark chosen sector
 
-      // collect all tiles in that sector
+      // 1) collect all type-1 tiles in that sector
       const x0 = sx * SECTOR_SIZE, y0 = sy * SECTOR_SIZE;
       const candidates = [];
       for (const key of mapTiles.keys()) {
         const [x, y] = key.split(',').map(Number);
         if (x >= x0 && x < x0 + SECTOR_SIZE
-          && y >= y0 && y < y0 + SECTOR_SIZE) {
+         && y >= y0 && y < y0 + SECTOR_SIZE) {
           const tile = mapTiles.get(key);
-          // Filter for type 1 tiles ---
           if (tile.type === 1) {
             candidates.push({ x, y });
           }
         }
       }
 
-      if (candidates.length === 0) {
-        this.log(`Patrolling: sector ${sx},${sy} has no spawn-tiles, skipping…`);
+      // 2) filter down to only those we can actually reach via A*
+      const reachable = candidates.filter(p => {
+        const path = aStarDaemon.aStar(
+          { x: me.x, y: me.y },
+          { x: p.x, y: p.y },
+          n => Math.abs(n.x - p.x) + Math.abs(n.y - p.y)
+        );
+        return Array.isArray(path) && path.length > 0;
+      });
+
+      if (reachable.length === 0) {
+        this.log(`Patrolling: sector ${sx},${sy} has no *reachable* spawn-tiles, skipping…`);
         continue;
       }
 
-      // try up to MAX_TILES_PER_SECTOR random picks
+      // 3) Try up to MAX_TILES_PER_SECTOR random picks from reachable tiles
       for (let tTry = 1; tTry <= MAX_TILES_PER_SECTOR; tTry++) {
         if (this.stopped) throw ['stopped'];
 
-        const { x, y } = candidates[Math.floor(Math.random() * candidates.length)];
+        const { x, y } = reachable[Math.floor(Math.random() * reachable.length)];
         this.log(`Patrolling → sector ${sx},${sy} → attempt ${tTry} @ (${x},${y})`);
         try {
+          // move to the chosen tile
           await this.subIntention(['go_to', x, y]);
-          
-          const dirs = [{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+
+          // then do a little random scouting around it
+          const dirs = [
+            { dx:  1, dy:  0 },
+            { dx: -1, dy:  0 },
+            { dx:  0, dy:  1 },
+            { dx:  0, dy: -1 }
+          ];
           for (let i = 0; i < SCOUT_STEPS; i++) {
             if (this.stopped) throw ['stopped'];
-            const {dx,dy} = dirs[Math.floor(Math.random()*4)];
+            const { dx, dy } = dirs[Math.floor(Math.random() * dirs.length)];
             const nx = me.x + dx, ny = me.y + dy;
             const key = `${nx},${ny}`, tile = mapTiles.get(key);
-            if (!tile.locked) {
+            if (tile && !tile.locked) {
               try {
                 this.log(`scouting → (${nx},${ny})`);
                 await this.subIntention(['go_to', nx, ny]);
@@ -1279,7 +1282,6 @@ class Patrolling extends Plan {
             } else {
               this.log(`skip invalid (${nx},${ny})`);
             }
-            // small pause so you don’t zip instantly:
             await new Promise(r => setTimeout(r, 50));
           }
 
@@ -1287,15 +1289,13 @@ class Patrolling extends Plan {
           return true;
 
         } catch {
-          this.log(  `Patrolling: (${x},${y}) blocked, retrying…`);
-          // immediate retry; no setTimeout
+          this.log(`Patrolling: (${x},${y}) blocked, retrying…`);
         }
       }
 
       this.log(`Patrolling: sector ${sx},${sy} exhausted, picking new sector…`);
     }
 
-    // all sectors & tiles tried, give up
     this.log('Patrolling: all sectors exhausted—aborting patrol');
     throw ['stopped'];
   }
