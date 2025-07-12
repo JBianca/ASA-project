@@ -23,6 +23,7 @@ const MAX_TILES_PER_SECTOR = 10;
 const SCOUT_STEPS = 5;            // scouting steps around parcel-spawning tiles
 
 const suspendedDeliveries = new Set();
+const handoffInProgressParcels = new Set();
 let suspendPatrolUntil = 0;
 
 globalThis.disableCorridorLocks = false;
@@ -32,11 +33,12 @@ const pendingCorridorPromises = new Map();
 let corridorSegments = [];
 let corridorLocks = {};
 
-const STATE_IDLE             = 'IDLE';
-const STATE_HANDOFF_PENDING  = 'HANDOFF_PENDING';
-const STATE_HANDOFF_ACTIVE   = 'HANDOFF_IN_PROGRESS';
+const STATE_IDLE = 'IDLE';
+const STATE_HANDOFF_PENDING = 'HANDOFF_PENDING';
+const STATE_HANDOFF_ACTIVE = 'HANDOFF_IN_PROGRESS';
 let state = STATE_IDLE;
 const pendingMsgs = [];
+let handoffTimeout = null;
 
 client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
@@ -430,11 +432,22 @@ function buildCorridorMap(width, height, tiles) {
   })));
 }
 
-function getCorridorId(x,y) {
-  const key = `${x},${y}`;
+function getCorridorId(x, y) {
+  // Always use integer grid positions
+  const key = `${Math.round(x)},${Math.round(y)}`;
   const cid = corridorCellMap.get(key) || null;
-  //console.log(`[${me.name}] getCorridorId(${key}) →`, cid);
   return cid;
+}
+
+function getCorridorOrNearbyId(x, y) {
+  let cid = getCorridorId(x, y);
+  if (cid) return cid;
+  // Try immediate neighbors
+  for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+    cid = getCorridorId(x+dx, y+dy);
+    if (cid) return cid;
+  }
+  return null;
 }
 
 async function askCorridorLock(toId, corridorId, owner) {
@@ -475,7 +488,9 @@ function findAdjacentSpots(center, k = 2) {
 async function chooseCorridorMeetpoint(retries = 10, waitMs = 200) {
   const mePt = { x: me.x, y: me.y };
   const matePt = agents.get(teamMateId) || lastSeenMate;
-  const cid = getCorridorId(mePt.x, mePt.y) || (matePt && getCorridorId(matePt.x, matePt.y));
+  const cid = getCorridorOrNearbyId(mePt.x, mePt.y) || (matePt && getCorridorOrNearbyId(matePt.x, matePt.y));
+
+  console.log("chooseCorridorMeetpoint: me at", mePt, "mate at", matePt, "cid:", cid);
   if (cid) {
     const keyList = corridorCellsById.get(cid) || [];
     const coords = keyList.map(k => {
@@ -635,7 +650,11 @@ client.onAgentsSensing(sensedAgents => {
   }
 
   for (const p of parcels.values()) {
-    if (!p.contested && suspendedDeliveries.has(p.id)) {
+    if (
+      !p.contested &&
+      suspendedDeliveries.has(p.id) &&
+      !handoffInProgressParcels.has(p.id)
+    ) {
       suspendedDeliveries.delete(p.id);
       console.log('[unsuspend]', p.id, 'no longer contested');
     }
@@ -1527,6 +1546,26 @@ class BulkCollect extends Plan {
   }
 }
 
+function startHandoffTimeout() {
+  clearTimeout(handoffTimeout);
+  handoffTimeout = setTimeout(() => {
+    console.warn('[Handoff Timeout] Handoff taking too long, aborting.');
+    abortHandoff();
+  }, 8000);
+}
+
+function abortHandoff() {
+  state = 'IDLE';
+  handoffInProgressParcels.clear();
+  suspendedDeliveries.clear();
+  myAgent.push(['patrolling']);
+}
+
+function completeHandoff() {
+  clearTimeout(handoffTimeout);
+  handoffTimeout = null;
+}
+
 class HandoffExecute extends Plan {
   static isApplicableTo(goal) {
     return goal === 'handoff_execute';
@@ -1535,111 +1574,125 @@ class HandoffExecute extends Plan {
   async execute(_, from, waitX, waitY, meetX, meetY, ...ids) {
     state = STATE_HANDOFF_ACTIVE;
     console.log(`[HANDOFF_EXECUTE] me.id=${me.id}  from=${from}  ids=${ids}`);
+    ids.forEach(pid => handoffInProgressParcels.add(pid));
+    startHandoffTimeout();
 
-    if (me.id === from) {
-      // ─────────── GIVER ───────────
-      // 1. Wait for both to be ready
-      const readyTs = Date.now();
-      client.emitSay(teamMateId, { action: 'handoff_ready', ts: readyTs });
-      console.log(`[HANDOFF_EXECUTE:GIVER] signaled ready, waiting for receiver...`);
+    try {
+      if (me.id === from) {
+        // ─────────── GIVER ───────────
+        // 1. Wait for both to be ready
+        const readyTs = Date.now();
+        client.emitSay(teamMateId, { action: 'handoff_ready', ts: readyTs });
+        console.log(`[HANDOFF_EXECUTE:GIVER] signaled ready, waiting for receiver...`);
 
-      await new Promise(resolve => {
-        const timeout = setTimeout(resolve, 2000);
-        client.onMsg((_,__,msg) => {
-          if (msg.action === 'handoff_ready' && msg.ts >= readyTs) {
-            clearTimeout(timeout);
-            resolve();
-          }
+        await new Promise(resolve => {
+          const timeout = setTimeout(resolve, 2000);
+          client.onMsg((_,__,msg) => {
+            if (msg.action === 'handoff_ready' && msg.ts >= readyTs) {
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
         });
-      });
 
-      // 2. Go to rendezvous (or proxy if blocked)
-      let dropX = meetX, dropY = meetY;
-      try {
-        console.log(`[HANDOFF_EXECUTE:GIVER] going to rendezvous (${meetX},${meetY})`);
+        // 2. Go to rendezvous (or proxy if blocked)
+        let dropX = meetX, dropY = meetY;
+        try {
+          console.log(`[HANDOFF_EXECUTE:GIVER] going to rendezvous (${meetX},${meetY})`);
+          await this.subIntention(['go_to', meetX, meetY]);
+        } catch {
+          const alts = findAdjacentSpots({ x: meetX, y: meetY }, 1);
+          if (alts.length) {
+            dropX = alts[0].x; dropY = alts[0].y;
+            console.log(`[HANDOFF_EXECUTE:GIVER] rendezvous blocked, proxy at (${dropX},${dropY})`);
+            await this.subIntention(['go_to', dropX, dropY]);
+          } else {
+            console.log(`[HANDOFF_EXECUTE:GIVER] all blocked, dropping at (${me.x},${me.y})`);
+            dropX = me.x; dropY = me.y;
+          }
+        }
+
+        // 3. Drop parcels
+        console.log(`[HANDOFF_EXECUTE:GIVER] dropping parcels ${ids} at (${dropX},${dropY})`);
+        for (const pid of ids) {
+          await client.emitPutdown();
+          suspendedDeliveries.add(pid);
+        }
+
+        // 4. Signal handoff done
+        console.log(`[HANDOFF_EXECUTE:GIVER] emitted handoff_done`);
+        client.emitSay(teamMateId, {
+          action: 'handoff_done',
+          parcels: ids,
+          ts: Date.now()
+        });
+
+      } else {
+        // ─────────── RECEIVER ───────────
+        // 1. Go to waitSpot (this should NEVER fail or be ignored)
+        console.log(`[HANDOFF_EXECUTE:RECV] moving to waitSpot (${waitX},${waitY})`);
+        await this.subIntention(['go_to', waitX, waitY]);
+
+        // 2. Signal ready and wait for giver’s ready
+        const readyTs = Date.now();
+        client.emitSay(teamMateId, { action: 'handoff_ready', ts: readyTs });
+        console.log(`[HANDOFF_EXECUTE:RECV] signaled ready, waiting for giver...`);
+        await new Promise(resolve => {
+          const timeout = setTimeout(resolve, 2000);
+          client.onMsg((_,__,msg) => {
+            if (msg.action === 'handoff_ready' && msg.ts >= readyTs) {
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
+        });
+
+        // 3. Wait for handoff_done from the giver
+        console.log(`[HANDOFF_EXECUTE:RECV] waiting for handoff_done for ${ids}`);
+        await waitForMsg(
+          msg => msg.action === 'handoff_done' &&
+                Array.isArray(msg.parcels) &&
+                msg.parcels.length === ids.length &&
+                msg.parcels.every(p => ids.includes(p)),
+          5000
+        );
+        console.log(`[HANDOFF_EXECUTE:RECV] got handoff_done; going to rendezvous (${meetX},${meetY})`);
+
+        // 4. Go to rendezvous and pick up
         await this.subIntention(['go_to', meetX, meetY]);
-      } catch {
-        const alts = findAdjacentSpots({ x: meetX, y: meetY }, 1);
-        if (alts.length) {
-          dropX = alts[0].x; dropY = alts[0].y;
-          console.log(`[HANDOFF_EXECUTE:GIVER] rendezvous blocked, proxy at (${dropX},${dropY})`);
-          await this.subIntention(['go_to', dropX, dropY]);
-        } else {
-          console.log(`[HANDOFF_EXECUTE:GIVER] all blocked, dropping at (${me.x},${me.y})`);
-          dropX = me.x; dropY = me.y;
-        }
-      }
-
-      // 3. Drop parcels
-      console.log(`[HANDOFF_EXECUTE:GIVER] dropping parcels ${ids} at (${dropX},${dropY})`);
-      for (const pid of ids) {
-        await client.emitPutdown();
-        suspendedDeliveries.add(pid);
-      }
-
-      // 4. Signal handoff done
-      console.log(`[HANDOFF_EXECUTE:GIVER] emitted handoff_done`);
-      client.emitSay(teamMateId, {
-        action: 'handoff_done',
-        parcels: ids,
-        ts: Date.now()
-      });
-
-    } else {
-      // ─────────── RECEIVER ───────────
-      // 1. Go to waitSpot (this should NEVER fail or be ignored)
-      console.log(`[HANDOFF_EXECUTE:RECV] moving to waitSpot (${waitX},${waitY})`);
-      await this.subIntention(['go_to', waitX, waitY]);
-
-      // 2. Signal ready and wait for giver’s ready
-      const readyTs = Date.now();
-      client.emitSay(teamMateId, { action: 'handoff_ready', ts: readyTs });
-      console.log(`[HANDOFF_EXECUTE:RECV] signaled ready, waiting for giver...`);
-      await new Promise(resolve => {
-        const timeout = setTimeout(resolve, 2000);
-        client.onMsg((_,__,msg) => {
-          if (msg.action === 'handoff_ready' && msg.ts >= readyTs) {
-            clearTimeout(timeout);
-            resolve();
+        for (const pid of ids) {
+          const p = parcels.get(pid);
+          if (p && !p.carriedBy) {
+            await client.emitPickup();
+            // confirm success in your post-pickup callback, or check state after a delay
+            if (parcels.get(pid)?.carriedBy === me.id) {
+              console.log(`[HANDOFF_EXECUTE:RECV] picked up ${pid}`);
+            } else {
+              console.log(`[HANDOFF_EXECUTE:RECV] pickup failed for ${pid}; will try later`);
+              myAgent.push(['go_pick_up', meetX, meetY, pid]);
+            }
+          } else {
+            // Already picked up or missing? Move on
+            console.log(`[HANDOFF_EXECUTE:RECV] ${pid} not present at pickup time.`);
           }
-        });
-      });
-
-      // 3. Wait for handoff_done from the giver
-      console.log(`[HANDOFF_EXECUTE:RECV] waiting for handoff_done for ${ids}`);
-      await waitForMsg(
-        msg => msg.action === 'handoff_done' &&
-              Array.isArray(msg.parcels) &&
-              msg.parcels.length === ids.length &&
-              msg.parcels.every(p => ids.includes(p)),
-        5000
-      );
-      console.log(`[HANDOFF_EXECUTE:RECV] got handoff_done; going to rendezvous (${meetX},${meetY})`);
-
-      // 4. Go to rendezvous and pick up
-      await this.subIntention(['go_to', meetX, meetY]);
-      for (const pid of ids) {
-        console.log(`[HANDOFF_EXECUTE:RECV] picking up ${pid}`);
-        await client.emitPickup();
-
-        const p = parcels.get(pid);
-        if (!p || p.carriedBy !== me.id) {
-          console.warn(`[HANDOFF_EXECUTE:RECV] FAILED to pick up ${pid}! p=`, p);
         }
+
+        // 5. Deliver
+        const dz = deliveryZones.reduce((a, b) =>
+          distance(me, a) < distance(me, b) ? a : b
+        );
+        myAgent.push(['go_deliver', dz.x, dz.y]);
       }
 
-      // 5. Deliver
-      const dz = deliveryZones.reduce((a, b) =>
-        distance(me, a) < distance(me, b) ? a : b
-      );
-      myAgent.push(['go_deliver', dz.x, dz.y]);
+      // Common: reset state and suspend patrol if receiver
+      if (me.id !== from) {
+        suspendPatrolUntil = Date.now() + 5000;
+      }
+    } finally {
+      ids.forEach(pid => handoffInProgressParcels.delete(pid));
+      state = STATE_IDLE;
+      completeHandoff();
     }
-
-    // Common: reset state and suspend patrol if receiver
-    if (me.id !== from) {
-      suspendPatrolUntil = Date.now() + 5000;
-    }
-    state = STATE_IDLE;
     return true;
   }
 }
