@@ -380,18 +380,6 @@ client.onMap((width, height, tiles) => {
     );
   }
   buildCorridorMap(width, height, tiles);
-  // if there is exactly one corridor that spans the map edge‐to‐edge, assume hallway:
-  // console.log('[DISABLE?] segment length:', corridorSegments[0].cells.length, 'max(width,height):', Math.max(width, height));
-  if (true) {
-    console.log('[DISABLE] hallway detected → disabling all corridor locks');
-    globalThis.disableCorridorLocks = true;
-
-    // clear any existing locks & cells
-    corridorLocks = {};
-    for (const entry of mapTiles.values()) {
-      entry.corridorLocked = false;
-    }
-  }
 });
 
 function buildCorridorMap(width, height, tiles) {
@@ -606,35 +594,67 @@ async function proposeHandoff(parcelIds) {
   return true;
 }
 
+let lastSharedCorridorAt = 0;
+const HYSTERESIS_MS = 5000;
 const agents = new Map();
 client.onAgentsSensing(sensedAgents => {
+  // Update agent positions
   for (const a of sensedAgents) {
     agents.set(a.id, { id: a.id, x: a.x, y: a.y, score: a.score });
-    if (a.id === teamMateId) {
-      lastSeenMate = { x: a.x, y: a.y };
-    }
+    if (a.id === teamMateId) lastSeenMate = { x: a.x, y: a.y };
   }
-
+  // Remove agents we no longer see
   const seenIds = new Set(sensedAgents.map(a => a.id));
   for (const id of agents.keys()) {
-    if (!seenIds.has(id)) {
-      agents.delete(id);
+    if (!seenIds.has(id)) agents.delete(id);
+  }
+
+  // ─── 0) If in a handoff, always disable corridor locks ───
+  if (state === STATE_HANDOFF_PENDING || state === STATE_HANDOFF_ACTIVE) {
+    if (!globalThis.disableCorridorLocks) {
+      console.log('[FORCE] in handoff → disabling corridor locks');
+      globalThis.disableCorridorLocks = true;
+      corridorLocks = {};
+      for (const tile of mapTiles.values()) {
+        tile.corridorLocked = false;
+      }
+    }
+  }
+  else {
+    // ─── 1) Otherwise, disable locks if both agents share the same corridor ───
+    const myCid = getCorridorId(me.x, me.y);
+    const mateObj = agents.get(teamMateId) || lastSeenMate;
+    const mateCid = mateObj && getCorridorOrNearbyId(mateObj.x, mateObj.y);
+
+    if (myCid && mateCid && myCid === mateCid) {
+      lastSharedCorridorAt = Date.now();
+      if (!globalThis.disableCorridorLocks) {
+        console.log(`[DISABLE] both agents are in corridor ${myCid} → suspending locks`);
+        globalThis.disableCorridorLocks = true;
+        corridorLocks = {};
+        for (const tile of mapTiles.values()) {
+          tile.corridorLocked = false;
+        }
+      }
+    } else if (Date.now() - lastSharedCorridorAt > HYSTERESIS_MS) {
+      if (globalThis.disableCorridorLocks) {
+        globalThis.disableCorridorLocks = false;
+        console.log('[ENABLE] re-enabling corridor locks');
+      }
     }
   }
 
-  // 2a) clear ALL old locks:
+  // ─── 2) Clear & re-lock the tiles under each sensed agent ───
   for (const entry of mapTiles.values()) {
     entry.locked = false;
   }
-
-  // 2b) lock the tiles under each sensed agent:
   for (const a of sensedAgents) {
     const key = `${a.x},${a.y}`;
     const tile = mapTiles.get(key);
     if (tile) tile.locked = true;
   }
 
-  // 3) mark every parcel.p.contested = true if some other agent is near it
+  // ─── 3) Mark contested parcels ───
   for (const p of parcels.values()) {
     let contested = false;
     for (const a of sensedAgents) {
@@ -649,6 +669,7 @@ client.onAgentsSensing(sensedAgents => {
     p.contested = contested;
   }
 
+  // ─── 4) Unsuspend parcels that are no longer contested (and not in a handoff) ───
   for (const p of parcels.values()) {
     if (
       !p.contested &&
@@ -660,6 +681,7 @@ client.onAgentsSensing(sensedAgents => {
     }
   }
 });
+
 
 const aStarDaemon = new AStarDaemon(mapTiles);
 
@@ -870,8 +892,7 @@ async function optionsGeneration() {
     }
   }
   else {
-
-    console.log('pushing patrolling from optionsGeneration()');
+    // console.log('pushing patrolling from optionsGeneration()');
     options.push(['patrolling']);
   }
 
