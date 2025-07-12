@@ -478,7 +478,7 @@ async function chooseCorridorMeetpoint(retries = 10, waitMs = 200) {
   const matePt = agents.get(teamMateId) || lastSeenMate;
   const cid = getCorridorOrNearbyId(mePt.x, mePt.y) || (matePt && getCorridorOrNearbyId(matePt.x, matePt.y));
 
-  console.log("chooseCorridorMeetpoint: me at", mePt, "mate at", matePt, "cid:", cid);
+  // console.log("chooseCorridorMeetpoint: me at", mePt, "mate at", matePt, "cid:", cid);
   if (cid) {
     const keyList = corridorCellsById.get(cid) || [];
     const coords = keyList.map(k => {
@@ -825,9 +825,9 @@ async function optionsGeneration() {
     if (matePos) {
       const mateDist = Math.abs(matePos.x - dz.x) + Math.abs(matePos.y - dz.y);
       
-      // 👉 if teammate can deliver faster, hand off
+      // if teammate can deliver faster, hand off
       if (mateDist < soloDist) {
-        console.log('[DBG] mateDist < soloDist:', mateDist, '<', soloDist);
+        // console.log('[DBG] mateDist < soloDist:', mateDist, '<', soloDist);
         await proposeHandoff(carriedIds);
         return;   // drop out of normal planning
       }
@@ -892,8 +892,22 @@ async function optionsGeneration() {
     }
   }
   else {
-    // console.log('pushing patrolling from optionsGeneration()');
-    options.push(['patrolling']);
+    // ─── FALLBACK: grab the nearest parcel, no matter what ───
+    const allParcels = [...parcels.values()]
+      .filter(p => !p.carriedBy && !suspendedDeliveries.has(p.id));
+    if (allParcels.length > 0) {
+      // sort by Manhattan distance
+      allParcels.sort((a,b) =>
+        (Math.abs(a.x - me.x) + Math.abs(a.y - me.y))
+        - (Math.abs(b.x - me.x) + Math.abs(b.y - me.y))
+      );
+      const p = allParcels[0];
+      console.log(`[FALLBACK] no high-value parcels → grabbing nearest ${p.id} @(${p.x},${p.y})`);
+      options.push(['go_pick_up', p.x, p.y, p.id]);
+    } else {
+      // console.log('pushing patrolling from optionsGeneration()');
+      options.push(['patrolling']);
+    }
   }
 
   // 4) don’t re‐push the same intention twice
