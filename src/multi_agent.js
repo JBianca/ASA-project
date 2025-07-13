@@ -1215,11 +1215,21 @@ class Patrolling extends Plan {
   async execute(goal) {
     if (this.stopped) throw ['stopped'];
 
+    // how long we’re willing to search for a reachable tile
+    const PATROL_TIMEOUT_MS = 3000;
+    const startTs = Date.now();
+
     // Try a handful of different sectors
     for (let sTry = 1; sTry <= MAX_SECTORS_TO_TRY; sTry++) {
+      // If we’ve been looping too long, abort patrol
+      if (Date.now() - startTs > PATROL_TIMEOUT_MS) {
+        this.log('Patrolling: timeout searching for reachable tiles—aborting patrol');
+        throw ['stopped'];
+      }
+
       const [sx, sy] = pickOldestSector(mapTiles);
-      markSector(me.x, me.y);    // mark *current* sector so we age others
-      markSector(sx * SECTOR_SIZE, sy * SECTOR_SIZE); // also mark chosen sector
+      markSector(me.x, me.y);
+      markSector(sx * SECTOR_SIZE, sy * SECTOR_SIZE);
 
       // 1) collect all type-1 tiles in that sector
       const x0 = sx * SECTOR_SIZE, y0 = sy * SECTOR_SIZE;
@@ -1229,13 +1239,11 @@ class Patrolling extends Plan {
         if (x >= x0 && x < x0 + SECTOR_SIZE
          && y >= y0 && y < y0 + SECTOR_SIZE) {
           const tile = mapTiles.get(key);
-          if (tile.type === 1) {
-            candidates.push({ x, y });
-          }
+          if (tile.type === 1) candidates.push({ x, y });
         }
       }
 
-      // 2) filter down to only those we can actually reach via A*
+      // 2) filter to only those we can actually reach
       const reachable = candidates.filter(p => {
         const path = aStarDaemon.aStar(
           { x: me.x, y: me.y },
@@ -1250,22 +1258,19 @@ class Patrolling extends Plan {
         continue;
       }
 
-      // 3) Try up to MAX_TILES_PER_SECTOR random picks from reachable tiles
+      // 3) Try up to MAX_TILES_PER_SECTOR random picks
       for (let tTry = 1; tTry <= MAX_TILES_PER_SECTOR; tTry++) {
         if (this.stopped) throw ['stopped'];
 
         const { x, y } = reachable[Math.floor(Math.random() * reachable.length)];
         this.log(`Patrolling → sector ${sx},${sy} → attempt ${tTry} @ (${x},${y})`);
         try {
-          // move to the chosen tile
           await this.subIntention(['go_to', x, y]);
 
-          // then do a little random scouting around it
+          // do some local scouting
           const dirs = [
-            { dx:  1, dy:  0 },
-            { dx: -1, dy:  0 },
-            { dx:  0, dy:  1 },
-            { dx:  0, dy: -1 }
+            { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
+            { dx: 0, dy: 1 }, { dx: 0, dy: -1 }
           ];
           for (let i = 0; i < SCOUT_STEPS; i++) {
             if (this.stopped) throw ['stopped'];
@@ -1277,7 +1282,7 @@ class Patrolling extends Plan {
                 this.log(`scouting → (${nx},${ny})`);
                 await this.subIntention(['go_to', nx, ny]);
               } catch {
-                this.log(`blocked @ (${nx},${ny}), stay put`);
+                this.log(`blocked @ (${nx},${ny}), staying put`);
               }
             } else {
               this.log(`skip invalid (${nx},${ny})`);
@@ -1296,7 +1301,8 @@ class Patrolling extends Plan {
       this.log(`Patrolling: sector ${sx},${sy} exhausted, picking new sector…`);
     }
 
-    this.log('Patrolling: all sectors exhausted—aborting patrol');
+    // All sectors tried (or timeout hit), give up
+    this.log('Patrolling: all sectors & attempts exhausted—aborting patrol');
     throw ['stopped'];
   }
 }
