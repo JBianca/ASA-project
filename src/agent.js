@@ -208,10 +208,6 @@ client.onAgentsSensing(sensedAgents => {
 const aStarDaemon = new AStarDaemon(mapTiles);
  
 function optionsGeneration() {
-  // if the *current* intention is BulkCollect, do nothing (don't replan!)
-  // console.log('[opts] all parcels:', [...parcels.keys()]);
-  // console.log('[opts] suspended:', Array.from(suspendedDeliveries));
-
   const current = myAgent.intention_queue[0];
   if (current && current.predicate[0] !== 'patrolling') {
     return;
@@ -498,7 +494,6 @@ class GoDeliver extends Plan {
       return true;
     }
 
-    // same “try each delivery‐zone with back-off” you already have…
     const zones = deliveryZones.slice().sort((a,b)=>distance(me,a)-distance(me,b));
     for (const dz of zones) {
       for (let attempt = 1; attempt <= 3; attempt++) {
@@ -507,7 +502,7 @@ class GoDeliver extends Plan {
           await this.subIntention(['go_to', dz.x, dz.y]);
           // success!
           for (const id of toDeliver) suspendedDeliveries.delete(id);
-          await client.emitPutdown();  // drop one by one if you like
+          await client.emitPutdown();
           return true;
         } catch (_) {
           this.log(`  GoDeliver: blocked at (${dz.x},${dz.y}) on attempt ${attempt}`);

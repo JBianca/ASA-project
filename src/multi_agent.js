@@ -7,7 +7,7 @@ import { default as argsParser } from "args-parser";
 const args = argsParser(process.argv);
 const host = args.host;
 const token = args.token;
-const teamMateId= args.teamId;
+const teamMateId = args.teamId;
 
 // Extract configuration parameters
 const CONTEST_RADIUS = parseInt(args.contestRadius) || 3;
@@ -53,7 +53,6 @@ let lastSeenMateState = null;
 client.onYou(({id, name, x, y, score}) => {
     me.id = id;
     me.name = name;
-    // console.log([${name}] Connected with ID: ${id});
     me.x = x;
     me.y = y;
     me.score = score;
@@ -198,8 +197,7 @@ client.onMsg(async (id, name, msg, reply) => {
       return;
     }
 
-    // 2) REQUEST: someone asks *you* to grant access → decide & reply,
-    //    but don’t touch mapTiles here
+    // 2) REQUEST: someone asks *you* to grant access → decide & reply
     case 'corridor_request': {
       const { corridorId, owner: requester, ts } = msg;
       if (requester === me.id) return;
@@ -222,7 +220,6 @@ client.onMsg(async (id, name, msg, reply) => {
     }
 
     // 3) RESPONSE: the reply to *your* request → just resolve the promise
-    //    (the shout that you immediately emit next will run the SHOUT handler)
     case 'corridor_response': {
       const { corridorId, granted } = msg;
       console.log(`[${me.name}] ← RESPONSE corridor ${corridorId}: granted=${granted}`);
@@ -374,7 +371,6 @@ export const mapTiles = new Map();
 client.onMap((width, height, tiles) => {
   mapTiles.clear();
   for (const t of tiles) {
-    // store an object, with both type and locked flag
     mapTiles.set(
       `${t.x},${t.y}`,
       { type: t.type, locked: false }
@@ -384,7 +380,6 @@ client.onMap((width, height, tiles) => {
 });
 
 function buildCorridorMap(width, height, tiles) {
-  // console.log(`[${me.name}] 🔄 got onMap, building corridor map…`);
 
   deliveryZones.length = 0;
   for (const tile of tiles) {
@@ -422,7 +417,6 @@ function buildCorridorMap(width, height, tiles) {
 }
 
 function getCorridorId(x, y) {
-  // Always use integer grid positions
   const key = `${Math.round(x)},${Math.round(y)}`;
   const cid = corridorCellMap.get(key) || null;
   return cid;
@@ -431,7 +425,6 @@ function getCorridorId(x, y) {
 function getCorridorOrNearbyId(x, y) {
   let cid = getCorridorId(x, y);
   if (cid) return cid;
-  // Try immediate neighbors
   for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
     cid = getCorridorId(x+dx, y+dy);
     if (cid) return cid;
@@ -463,7 +456,6 @@ function findAdjacentSpots(center, k = 2) {
       && [3].includes(tile.type)
       && !tile.locked
       && !tile.corridorLocked
-      // don’t pick a spot someone’s standing on:
       && !(x===me.x && y===me.y)
       && !(agents.get(teamMateId)?.x===x && agents.get(teamMateId)?.y===y)
     ) {
@@ -471,11 +463,11 @@ function findAdjacentSpots(center, k = 2) {
       if (spots.length === k) break;
     }
   }
-  return spots;  // maybe length < k if not enough free
+  return spots;
 }
 
 async function chooseCorridorMeetpoint(retries = 10, waitMs = 200) {
-  const mePt   = { x: me.x, y: me.y };
+  const mePt = { x: me.x, y: me.y };
   const matePt = agents.get(teamMateId) || lastSeenMate;
 
   // 1) which corridor are _either_ of us in?
@@ -501,13 +493,13 @@ async function chooseCorridorMeetpoint(retries = 10, waitMs = 200) {
     if (i1 < 0) i1 = 0;
     if (i2 < 0) i2 = coords.length-1;
 
-    // 3) take the sub‐array between you & your mate
+    // 3) take the sub‐array between us & our teammate
     const [start,end] = i1 < i2 ? [i1,i2] : [i2,i1];
     const segment = coords.slice(start, end+1);
 
     // 4) pick its midpoint
     const midIdx = Math.floor(segment.length/2);
-    const mid    = segment[midIdx];
+    const mid = segment[midIdx];
 
     // 5) exactly as before: try the mid with retries
     for (let attempt=0; attempt<retries; ++attempt) {
@@ -531,7 +523,7 @@ async function chooseCorridorMeetpoint(retries = 10, waitMs = 200) {
       const d = Math.abs(tile.x-mid.x)+Math.abs(tile.y-mid.y);
       if (d < bestDist) {
         bestDist = d;
-        best     = { x: tile.x, y: tile.y, waitSpot: adj[0] };
+        best = { x: tile.x, y: tile.y, waitSpot: adj[0] };
       }
     }
     if (best) {
@@ -564,7 +556,7 @@ async function proposeHandoff(parcelIds) {
     action:     'handoff_request',
     parcels:    parcelIds,
     rendezvous: { x: rx, y: ry },
-    waitSpot:   { x: wx, y: wy },    // <-- send the actual waitSpot
+    waitSpot:   { x: wx, y: wy },
     ts:         Date.now()
   });
   console.log('SENT handoff_request:', {
@@ -579,7 +571,7 @@ async function proposeHandoff(parcelIds) {
 
   myAgent.unconditionalPush([
     'handoff_execute',
-    me.id,   // “from”
+    me.id,
     wx, wy,  // receiver’s waitSpot (giver will skip this)
     rx, ry,  // rendezvous
     ...parcelIds
@@ -716,12 +708,6 @@ function assignParcelsToMe() {
     const myNet = p.expectedUtility - PENALTY * ( myCost    / (DECAY_INTERVAL_MS/1000) );
     const theirNet = p.expectedUtility - PENALTY * ( theirCost / (DECAY_INTERVAL_MS/1000) );
 
-    //console.log(
-      //`[assign] parcel ${id}: reward=${p.expectedUtility.toFixed(1)}, `,
-      //`myCost=${myCost.toFixed(1)}, theirCost=${theirCost.toFixed(1)}, `,
-      //`myNet=${myNet.toFixed(2)}, theirNet=${theirNet.toFixed(2)}`
-    //);
-
     if (myNet > theirNet) {
       assigned.add(id);
     }
@@ -744,10 +730,6 @@ function assignParcelsToMe() {
 }
 
 async function optionsGeneration() {
-  // console.trace(`[${me.name}] optionsGeneration()`);
-  // if the *current* intention is BulkCollect, do nothing (don't replan!)
-  // console.log('[opts] all parcels:', [...parcels.keys()]);
-  // console.log('[opts] suspended:', Array.from(suspendedDeliveries));
   if (state === STATE_HANDOFF_PENDING || state === STATE_HANDOFF_ACTIVE) {
     return;
   }
@@ -951,7 +933,7 @@ class IntentionRevision {
 async loop() {
   console.log('Intention loop running, queue:', this.#intention_queue.map(i => i.predicate));
   let lastActionTime = Date.now();
-  const STUCK_THRESHOLD = 3000; // ms
+  const STUCK_THRESHOLD = 3000;
 
   while (true) {
     // ─── 1) Preempt everything once we enter a handoff ───
@@ -961,7 +943,6 @@ async loop() {
         && first.predicate[0] !== 'handoff_execute'
         && this.intention_queue.some(i => i.predicate[0] === 'handoff_execute')) {
       console.log('[handoff] preempting to handoff_execute');
-      // stop *all* running plans
       for (const intent of this.#intention_queue) intent.stop();
       // keep only the handoff_execute intent in the queue (if it’s there)
       this.#intention_queue = this.#intention_queue
@@ -979,7 +960,6 @@ async loop() {
         // console.log('[LOOP] Exception in achieve:', err);
         ran = true;
       }
-      // Only shift if this is STILL the head of the queue!
       if (this.#intention_queue[0] === intention && ran) {
         this.#intention_queue.shift();
       }
@@ -987,7 +967,6 @@ async loop() {
       continue;
     }
 
-    // ─── 3) If we’re still in handoff but nothing to execute yet, just wait ───
     if (state !== STATE_IDLE) {
       await new Promise(r => setTimeout(r, 50));
       continue;
@@ -1005,12 +984,10 @@ async loop() {
       lastActionTime = Date.now();
     }
 
-    // small yield so we don’t spin the loop too hard
     await new Promise(r => setImmediate(r));
   }
 }
 
-  // Regular push: avoid queueing the same intention
   async push(predicate) {
     // console.log(`[PUSH] State: ${state}, predicate:`, predicate);
     const last = this.intention_queue.at(-1);
@@ -1018,7 +995,6 @@ async loop() {
     const intention = new Intention(this, predicate);
     this.intention_queue.push(intention);
 
-    // If there was a previous intention, stop it so we only follow one at a time
     if (last) last.stop();
   }
 
@@ -1173,7 +1149,6 @@ if (!toDeliver.length) {
       return true;
     }
 
-    // same “try each delivery‐zone with back-off” you already have…
     const reachableZones = deliveryZones
       .filter(z => {
         const path = aStarDaemon.aStar(
@@ -1201,7 +1176,7 @@ if (!toDeliver.length) {
       this.log(  `GoDeliver: giving up on zone (${dz.x},${dz.y}), trying next`);
     }
 
-    // if we get here, *all* zones failed → suspend these parcels
+    // *all* zones failed → suspend these parcels
     for (const id of toDeliver) suspendedDeliveries.add(id);
     this.log('GoDeliver: all zones blocked → suspending delivery of', toDeliver);
     throw ['stopped'];   // abort so that optionsGeneration will pick something else
@@ -1220,7 +1195,6 @@ class Patrolling extends Plan {
     const PATROL_TIMEOUT_MS = 3000;
     const startTs = Date.now();
 
-    // Try a handful of different sectors
     for (let sTry = 1; sTry <= MAX_SECTORS_TO_TRY; sTry++) {
       // If we’ve been looping too long, abort patrol
       if (Date.now() - startTs > PATROL_TIMEOUT_MS) {
@@ -1434,16 +1408,14 @@ class AstarMove extends Plan {
           const beforeX = me.x;
           const beforeY = me.y;
 
-          // Attempt the move
           const moveResult = await client.emitMove(step.action);
 
           if (!moveResult) {
             this.log(`AstarMove: Move blocked (action: ${step.action})`);
             retries++;
-            break; // Replan if move was denied
+            break;
           }
 
-          // Wait to confirm movement was successful
           let confirmed = false;
           for (let i = 0; i < STEP_CONFIRM_TIMEOUT; i++) {
             await sleep(20);
@@ -1453,14 +1425,12 @@ class AstarMove extends Plan {
             }
           }
 
-          // If not move, trigger replanning
           if (!confirmed) {
             this.log('AstarMove: Move unconfirmed → aborting path');
             retries++;
             break;
           }
 
-          // Update current position
           currentX = me.x;
           currentY = me.y;
 
@@ -1495,7 +1465,6 @@ class AstarMove extends Plan {
       // console.log("[DEBUG] Skipping opportunistic actions during handoff");
       return;
     }
-    // Get all parcels currently carried
     const carried = [...parcels.values()].filter(p => p.carriedBy === me.id);
 
     // Opportunistically pick up parcel at current location if reward is still good
@@ -1530,9 +1499,6 @@ class BulkCollect extends Plan {
     return goal === 'bulk_collect';
   }
 
-  /**
-   * predicate = ['bulk_collect', id1, id2, ..., idN]
-   */
   async execute(goal, ...ids) {
     if (this.stopped) throw ['stopped'];
     this.log('BulkCollect starting…');
@@ -1685,7 +1651,7 @@ class HandoffExecute extends Plan {
 
       } else {
         // ─────────── RECEIVER ───────────
-        // 1. Go to waitSpot (this should NEVER fail or be ignored)
+        // 1. Go to waitSpot
         console.log(`[HANDOFF_EXECUTE:RECV] moving to waitSpot (${waitX},${waitY})`);
         await this.subIntention(['go_to', waitX, waitY]);
 
