@@ -10,12 +10,12 @@ const config = {
   scoutSteps: 5,            // scouting steps around parcel-spawning tiles
 };
 
-const nance = { id: '166aab', name: 'nance',
-token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjE2NmFhYiIsIm5hbWUiOiJuYW5jZSIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzQzOTQ4NzkzfQ.ITgFywL_aIusiXJCbtnzpao4Mt1qz_-h4o1Z_aqxxS4'
+const nance = { id: 'd2942d', name: 'nance',
+token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImQyOTQyZCIsIm5hbWUiOiJuYW5jZSIsInRlYW1JZCI6IjFlYTk4NiIsInRlYW1OYW1lIjoiZGV2Iiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTE2NTQ1MTJ9.EPfL9dFhPkwaHoTYoW206FxxdGKaThySaECglaqABFw'
 };
 
-const bianca = { id: '830c2c', name: 'bianca',
-token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgzMGMyYyIsIm5hbWUiOiJ0ZXN0MiIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzQ1MzMyNTQ1fQ.v5PXhRCocKCRWmZav3IO72qcouAsuTe4qjrXlsbGAbw'
+const bianca = { id: 'f65488', name: 'bianca',
+token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImY2NTQ4OCIsIm5hbWUiOiJiaWFuY2EiLCJ0ZWFtSWQiOiJlMWNkNTkiLCJ0ZWFtTmFtZSI6ImRldiIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzUxNjU0NTE4fQ.fh0-un726MBi3BMk1DjX8R8hr2HXRBcuf68wVLbBLfM'
 };
 
 // Start the processes
@@ -26,8 +26,6 @@ spawnProcesses( bianca, nance );
 function spawnProcesses( me, teamMate ) {
 
     const args = [
-    `token=${me.token}`,
-    `teamId=${teamMate.id}`,
     `contestRadius=${config.contestRadius}`,
     `contestPenalty=${config.contestPenalty}`,
     `maxSectorsToTry=${config.maxSectorsToTry}`,
