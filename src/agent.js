@@ -1,9 +1,21 @@
 import { DeliverooApi, ioClientSocket } from "@unitn-asa/deliveroo-js-client";
-import config from "../config.js";
 import AStarDaemon from "./astar_daemon.js";
 import { distance, pickOldestSector, markSector, SECTOR_SIZE } from './utils.js';
 import selectOptimalBatch from "./select_batch.js";
+import { 
+  state,
+  config,
+  CONTEST_RADIUS,
+  CONTEST_PENALTY,
+  MAX_SECTORS_TO_TRY,
+  MAX_TILES_PER_SECTOR,
+  SCOUT_STEPS
+} from './state.js';
 
+const {
+  me, parcels, deliveryZones, mapTiles, agents, 
+  suspendedDeliveries
+} = state
 const client = new DeliverooApi(
   config.host,
   config.token
@@ -12,20 +24,10 @@ const client = new DeliverooApi(
 let PENALTY;
 let DECAY_INTERVAL_MS;
 
-const CONTEST_RADIUS = 3;         // Manhattan distance threshold
-const CONTEST_PENALTY = 0.5;      // 50% discount on contested parcels
-const MAX_SECTORS_TO_TRY = 5;
-const MAX_TILES_PER_SECTOR = 10;
-const SCOUT_STEPS = 5;            // scouting steps around parcel-spawning tiles
-
-const suspendedDeliveries = new Set();
-
 client.onConfig(cfg => {
   PENALTY = cfg.PENALTY;
   DECAY_INTERVAL_MS = parseInt(cfg.PARCEL_DECADING_INTERVAL) * 1000;
 });
-
-const me = {id: null, name: null, x: null, y: null, score: null};
 
 client.onYou(({id, name, x, y, score}) => {
     me.id = id;
@@ -35,7 +37,6 @@ client.onYou(({id, name, x, y, score}) => {
     me.score = score;
 });
 
-const parcels = new Map();
 client.onParcelsSensing(pp => {
   const now     = Date.now();
   const seenIds = new Set(pp.map(p => p.id));
@@ -114,7 +115,6 @@ client.onParcelsSensing(pp => {
   }
 });
 
-const deliveryZones = [];
 client.onMap((width, height, tiles) => {
   deliveryZones.length = 0;
 
@@ -138,8 +138,6 @@ client.onTile(tile => {
   }
 });
 
-export const mapTiles = new Map();
-
 client.onMap((width, height, tiles) => {
   mapTiles.clear();
   for (const t of tiles) {
@@ -160,7 +158,6 @@ client.onTile(tile => {
   }
 });
 
-const agents = new Map();
 client.onAgentsSensing(sensedAgents => {
   for (const a of sensedAgents) {
     agents.set(a.id, { id: a.id, x: a.x, y: a.y, score: a.score });
@@ -398,7 +395,6 @@ class IntentionRevisionReplace extends IntentionRevision {
 
 const myAgent = new IntentionRevisionReplace();
 myAgent.loop();
-
 const planLibrary = [];
 
 class Plan {
