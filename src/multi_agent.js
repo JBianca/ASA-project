@@ -173,7 +173,7 @@ client.onMsg(async (id, name, msg, reply) => {
         ]);
     }
 
-    console.log('queue now =', myAgent.intention_queue.map(i => i.predicate));
+    // console.log('queue now =', myAgent.intention_queue.map(i => i.predicate));
     return;
   }
 
@@ -182,9 +182,9 @@ client.onMsg(async (id, name, msg, reply) => {
     // 1) SHOUT: everyone (including you) hears “this corridor is now owned by X”
     case 'corridor': {
       const { corridorId, owner: locker, ts } = msg;
-      console.log(
-        `[${me.name}] ← SHOUT corridor ${corridorId} now owned by ${locker} @ ${new Date(ts).toISOString()}`
-      );
+      //console.log(
+        //`[${me.name}] ← SHOUT corridor ${corridorId} now owned by ${locker} @ ${new Date(ts).toISOString()}`
+      //);
 
       // update who holds the lock
       if (!corridorLocks[corridorId] || ts >= corridorLocks[corridorId].ts) {
@@ -201,9 +201,9 @@ client.onMsg(async (id, name, msg, reply) => {
     case 'corridor_request': {
       const { corridorId, owner: requester, ts } = msg;
       if (requester === me.id) return;
-      console.log(
-        `[${me.name}] ← REQUEST corridor ${corridorId} from ${requester} @ ${new Date(ts).toISOString()}`
-      );
+      //console.log(
+        //`[${me.name}] ← REQUEST corridor ${corridorId} from ${requester} @ ${new Date(ts).toISOString()}`
+      //);
       const current = corridorLocks[corridorId];
       const willGrant = !current || current.owner === requester || ts < current.ts;
       console.log(`[${me.name}] → willGrant=${willGrant} (current owner=${current?.owner||'none'})`);
@@ -222,7 +222,7 @@ client.onMsg(async (id, name, msg, reply) => {
     // 3) RESPONSE: the reply to *your* request → just resolve the promise
     case 'corridor_response': {
       const { corridorId, granted } = msg;
-      console.log(`[${me.name}] ← RESPONSE corridor ${corridorId}: granted=${granted}`);
+      // console.log(`[${me.name}] ← RESPONSE corridor ${corridorId}: granted=${granted}`);
       const resolve = pendingCorridorPromises.get(corridorId);
       if (resolve) {
         resolve(granted);
@@ -593,8 +593,13 @@ client.onAgentsSensing(sensedAgents => {
     if (!seenIds.has(id)) agents.delete(id);
   }
 
-  const singleCorridor = (corridorSegments.length === 1);
   const mateObj = agents.get(teamMateId) || lastSeenMate;
+  if (!mateObj) {
+    // no position yet → keep locks active
+    return;
+  }
+
+  const singleCorridor = (corridorSegments.length === 1);
   const myStrict = getCorridorId(me.x, me.y);
   const mateStrict = mateObj && getCorridorId(mateObj.x, mateObj.y);
 
@@ -784,7 +789,7 @@ async function optionsGeneration() {
       
       // if teammate can deliver faster, hand off
       if (mateDist < soloDist) {
-        console.log('[DBG] mateDist < soloDist:', mateDist, '<', soloDist);
+        // console.log('[DBG] mateDist < soloDist:', mateDist, '<', soloDist);
         await proposeHandoff(carriedIds);
         return;   // drop out of normal planning
       }
@@ -931,7 +936,7 @@ class IntentionRevision {
   get intention_queue() { return this.#intention_queue; }
 
 async loop() {
-  console.log('Intention loop running, queue:', this.#intention_queue.map(i => i.predicate));
+  // console.log('Intention loop running, queue:', this.#intention_queue.map(i => i.predicate));
   let lastActionTime = Date.now();
   const STUCK_THRESHOLD = 3000;
 
@@ -999,14 +1004,14 @@ async loop() {
   }
 
   unconditionalPush(predicate) {
-    console.log(`[UNCONDPUSH] State: ${state}, predicate:`, predicate);
+    // console.log(`[UNCONDPUSH] State: ${state}, predicate:`, predicate);
     for (const intent of this.#intention_queue) {
       intent.stop();
     }
     this.#intention_queue = [];
     const intent = new Intention(this, predicate);
     this.#intention_queue.push(intent);
-    console.log('[UNCONDPUSH after]', this.#intention_queue.map(i => i.predicate));
+    // console.log('[UNCONDPUSH after]', this.#intention_queue.map(i => i.predicate));
   }
 }
 
@@ -1229,7 +1234,7 @@ class Patrolling extends Plan {
       });
 
       if (reachable.length === 0) {
-        this.log(`Patrolling: sector ${sx},${sy} has no *reachable* spawn-tiles, skipping…`);
+        // this.log(`Patrolling: sector ${sx},${sy} has no *reachable* spawn-tiles, skipping…`);
         continue;
       }
 
@@ -1238,7 +1243,7 @@ class Patrolling extends Plan {
         if (this.stopped) throw ['stopped'];
 
         const { x, y } = reachable[Math.floor(Math.random() * reachable.length)];
-        this.log(`Patrolling → sector ${sx},${sy} → attempt ${tTry} @ (${x},${y})`);
+        // this.log(`Patrolling → sector ${sx},${sy} → attempt ${tTry} @ (${x},${y})`);
         try {
           await this.subIntention(['go_to', x, y]);
 
@@ -1277,7 +1282,7 @@ class Patrolling extends Plan {
     }
 
     // All sectors tried (or timeout hit), give up
-    this.log('Patrolling: all sectors & attempts exhausted—aborting patrol');
+    // this.log('Patrolling: all sectors & attempts exhausted—aborting patrol');
     throw ['stopped'];
   }
 }
@@ -1351,7 +1356,7 @@ class AstarMove extends Plan {
           const ts = Date.now();
           corridorLocks[cid] = { owner: me.id, ts };
           const cells = corridorCellsById.get(cid) || [];
-          console.log("CLEARED locally:", cid, cells);
+          // console.log("CLEARED locally:", cid, cells);
           for (const key of cells) {
             mapTiles.get(key).corridorLocked = false;
           }
@@ -1587,7 +1592,7 @@ class HandoffExecute extends Plan {
 
   async execute(_, from, waitX, waitY, meetX, meetY, ...ids) {
     state = STATE_HANDOFF_ACTIVE;
-    console.log(`[HANDOFF_EXECUTE] me.id=${me.id}  from=${from}  ids=${ids}`);
+    // console.log(`[HANDOFF_EXECUTE] me.id=${me.id}  from=${from}  ids=${ids}`);
     const cid = getCorridorId(meetX, meetY);
     if (cid) {
       for (const key of corridorCellsById.get(cid) || []) {
