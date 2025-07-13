@@ -1,5 +1,5 @@
 import { DeliverooApi, ioClientSocket } from "@unitn-asa/deliveroo-js-client";
-import AStarDaemon from "./astar_daemon.js";
+import AStarDaemon from "./astar_daemon_single.js";
 import { distance, pickOldestSector, markSector, SECTOR_SIZE } from './utils.js';
 import selectOptimalBatch from "./select_batch.js";
 import { planner, goalParser, mapParser, readDomain } from "./pddl_planner.js"; // Add PDDL imports
@@ -547,7 +547,7 @@ class PddlPlan extends Plan {
       if (this.stopped) throw "Aborted";  // Stop if the plan is aborted
 
       const actionLower = action.toLowerCase();
-      console.log("action: ", actionLower);
+      //console.log("action: ", actionLower);
 
       try {
         if (['up','down','left','right'].includes(actionLower)) {
