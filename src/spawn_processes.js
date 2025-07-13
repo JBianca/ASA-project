@@ -1,6 +1,15 @@
 // import child_process in ES module
 import { spawn } from 'child_process';
 
+// Configuration parameters
+const config = {
+  contestRadius: 3,         // Manhattan distance threshold
+  contestPenalty: 0.5,      // 50% discount on contested parcels
+  maxSectorsToTry: 5,
+  maxTilesPerSector: 10,
+  scoutSteps: 5,            // scouting steps around parcel-spawning tiles
+};
+
 const nance = { id: '166aab', name: 'nance',
 token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjE2NmFhYiIsIm5hbWUiOiJuYW5jZSIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzQzOTQ4NzkzfQ.ITgFywL_aIusiXJCbtnzpao4Mt1qz_-h4o1Z_aqxxS4'
 };
@@ -15,6 +24,16 @@ spawnProcesses( bianca, nance );
 
 // Function to spawn child processes
 function spawnProcesses( me, teamMate ) {
+
+    const args = [
+    `token=${me.token}`,
+    `teamId=${teamMate.id}`,
+    `contestRadius=${config.contestRadius}`,
+    `contestPenalty=${config.contestPenalty}`,
+    `maxSectorsToTry=${config.maxSectorsToTry}`,
+    `maxTilesPerSector=${config.maxTilesPerSector}`,
+    `scoutSteps=${config.scoutSteps}`,
+  ];
     
     const childProcess = spawn(
         `node multi_agent \

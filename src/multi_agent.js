@@ -9,18 +9,19 @@ const host = args.host;
 const token = args.token;
 const teamMateId= args.teamId;
 
+// Extract configuration parameters
+const CONTEST_RADIUS = parseInt(args.contestRadius) || 3;
+const CONTEST_PENALTY = parseFloat(args.contestPenalty) || 0.5;
+const MAX_SECTORS_TO_TRY = parseInt(args.maxSectorsToTry) || 5;
+const MAX_TILES_PER_SECTOR = parseInt(args.maxTilesPerSector) || 10;
+const SCOUT_STEPS = parseInt(args.scoutSteps) || 5;
+
 var pickupCoordination = {};
 
 const client = new DeliverooApi(host, token);
 
 let PENALTY;
-let DECAY_INTERVAL_MS;
-
-const CONTEST_RADIUS = 3;         // Manhattan distance threshold
-const CONTEST_PENALTY = 0.5;      // 50% discount on contested parcels
-const MAX_SECTORS_TO_TRY = 5;
-const MAX_TILES_PER_SECTOR = 10;
-const SCOUT_STEPS = 5;            // scouting steps around parcel-spawning tiles
+let DECAY_INTERVAL_MS;          // scouting steps around parcel-spawning tiles
 
 const suspendedDeliveries = new Set();
 const handoffInProgressParcels = new Set();
