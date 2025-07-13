@@ -1,4 +1,4 @@
-# Implementation of a BDI Agent System for the Deliveroo Game
+# BDI Agent System for the Deliveroo Game
 
 Course: Autonomous Software Agents 2024/25 – Artificial Intelligence Systems (Master’s Degree)
 
